@@ -1,0 +1,21 @@
+{
+  "timestamp": 1719600000,
+  "categories": [],
+  "brands": [],
+  "filters": {},
+  "global_filters": {
+    "size": [],
+    "color": [],
+    "status": [],
+    "material": [],
+    "season": [],
+    "gender": [],
+    "type": [],
+    "style": [],
+    "pattern": [],
+    "brand_type": [],
+    "occasion": [],
+    "tech_features": [],
+    "length": []
+  }
+}
