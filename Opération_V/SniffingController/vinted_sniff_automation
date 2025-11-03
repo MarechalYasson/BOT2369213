@@ -1,0 +1,1026 @@
+"""Android Sniffing Automation (NSA-Compliant) - WSA Edition"""
+import subprocess
+import time
+import logging
+import os
+import sys
+import platform
+import re
+import glob
+import json
+import threading
+import queue
+import frida
+import zipfile
+import shutil
+from dotenv import load_dotenv
+from cryptography.fernet import Fernet
+from datetime import datetime
+
+# === CONFIGURATION ===
+load_dotenv()
+ADB = os.getenv("ADB_EXEC", "adb")
+MITMPROXY = os.getenv("MITM_EXEC", "mitmdump")
+FRIDA_SCRIPT = os.getenv("FRIDA_SCRIPT", "ssl_bypass_all.js")
+APP_PACKAGE = os.getenv("APP_PACKAGE", "fr.vinted")
+MITM_HOST = os.getenv("MITM_HOST", "192.168.1.167")
+MITM_PORT = int(os.getenv("MITM_PORT", "8080"))
+MAX_SPAWN_RETRIES = 5
+ADB_DEVICE = os.getenv("ADB_DEVICE", "")
+WSA_ADDRESS = "127.0.0.1:58526"
+TIMEOUT = int(os.getenv("SNIFF_TIMEOUT", "300"))
+NO_MITM = "--no-mitm" in sys.argv
+WSA_INIT_TIMEOUT = 30
+FRIDA_JAVA_TIMEOUT = 600  # Augmenté à 10 minutes
+USE_MULTI_PROCESS = True  # Nouveau mode multi-processus
+
+# Cookie extraction settings
+COOKIES_FILE = os.path.join(os.path.dirname(__file__), ".env.cookies")
+COOKIES_JSON = os.path.join(os.path.dirname(__file__), "cookies.json")
+ARCHIVE_DIR = os.path.join(os.path.dirname(__file__), "cookies_archive")
+FRIDA_LOG_DIR = os.path.join(os.path.dirname(__file__), "frida_logs")
+MITM_LOG_DIR = os.path.join(os.path.dirname(__file__), "mitm_logs")
+KEY_FILE = os.path.join(os.path.dirname(__file__), "cookie.key")
+os.makedirs(ARCHIVE_DIR, exist_ok=True)
+os.makedirs(FRIDA_LOG_DIR, exist_ok=True)
+os.makedirs(MITM_LOG_DIR, exist_ok=True)
+
+# Regex patterns
+SESSION_REGEX = re.compile(r'^[a-fA-F0-9]{128}$')  # Strict format
+DATADOME_REGEX = re.compile(r'^[a-zA-Z0-9_\-\.]{50,}$')
+TOKEN_REGEX = re.compile(r'(vinted_token|access_token|authorization|jwt|auth_token|session_token|firebase_token|google_token|fb_token|token_v2|token_v3|token)')
+TOKEN_VALUE_REGEX = re.compile(r'(?:=|:)\s*([a-zA-Z0-9_\-\.=]{10,512})')
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)-8s %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+# === CORE FUNCTIONS ===
+class FridaMessageHandler:
+    """Handles Frida messages with async logging and batching"""
+    def __init__(self):
+        self.essential_tokens = {
+            '_vinted_fr_session': 'VINTED_SESSION_COOKIE',
+            'datadome': 'DATADOME_COOKIE',
+            'Authorization': 'AUTHORIZATION',
+            'csrftoken': 'CSRF_TOKEN',
+            'vt_auth': 'VT_AUTH'
+        }
+        self.collected_cookies = {}
+        self.log_buffer = []
+        self.log_queue = queue.Queue()
+        self.log_thread = threading.Thread(target=self.log_worker, daemon=True)
+        self.log_thread.start()
+        self.log_file = open(os.path.join(FRIDA_LOG_DIR, "frida_raw.log"), "a", encoding="utf-8")
+        self.java_ready_event = threading.Event()
+        self.java_error_event = threading.Event()
+        self.java_status = "INIT"  # Nouvel attribut pour le statut JVM
+
+    def log_worker(self):
+        while True:
+            message = self.log_queue.get()
+            if message is None:
+                break
+            logging.info(message)
+            time.sleep(0.01)
+
+    def on_message(self, message, data):
+        self.log_file.write(json.dumps(message) + "\n")
+        self.log_file.flush()
+
+        # Handle Java reference errors
+        if message.get('type') == 'error' and "Java is not defined" in message.get('description', ''):
+            self.log_queue.put("⚠️ Java reference error detected")
+            self.java_error_event.set()
+
+        if message.get('type') == 'send':
+            payload = message.get('payload', {})
+
+            if isinstance(payload, dict) and payload.get('type') == 'log':
+                log_msg = payload.get('msg', '')
+                self.log_buffer.append(log_msg)
+                self.log_queue.put(f"[Frida] {log_msg}")
+
+                if "Java environment READY" in log_msg:
+                    self.java_ready_event.set()
+
+            elif isinstance(payload, dict):
+                if 'batch' in payload:
+                    for token in payload['batch']:
+                        self.process_token(token)
+                else:
+                    self.process_token(payload)
+
+    def process_token(self, token_data):
+        token_key = token_data.get('key')
+        token_value = token_data.get('value')
+        if token_key and token_value:
+            std_key = self.essential_tokens.get(token_key, token_key.upper())
+            self.collected_cookies[std_key] = token_value
+            self.log_queue.put(f"[Frida] 🔍 Captured {std_key} = {token_value[:15]}...")
+
+    def save_logs(self):
+        if not self.log_buffer:
+            return None
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(FRIDA_LOG_DIR, f"frida_{timestamp}.log")
+
+        try:
+            with open(log_path, 'w', encoding='utf-8') as f:
+                f.write("\n".join(self.log_buffer))
+            logging.info(f"📁 Frida logs archived: {log_path}")
+            return log_path
+        except Exception as e:
+            logging.error(f"Failed to save Frida logs: {str(e)}")
+            return None
+
+    def stop(self):
+        self.log_queue.put(None)
+        self.log_thread.join(timeout=1.0)
+        self.log_file.close()
+        return self.save_logs()
+
+class MitmOutputReader(threading.Thread):
+    def __init__(self, process):
+        threading.Thread.__init__(self)
+        self.process = process
+        self.cookies = {}
+        self.found_cookies = threading.Event()
+        self.stop_event = threading.Event()
+        self.log_buffer = []
+
+    def run(self):
+        while not self.stop_event.is_set():
+            output = self.process.stdout.readline()
+            if output == '' and self.process.poll() is not None:
+                break
+            if output:
+                decoded = output.decode('utf-8', errors='ignore').strip()
+                self.log_buffer.append(decoded)
+                self.parse_output(decoded)
+
+    def parse_output(self, line):
+        session_match = re.search(r'Set-Cookie: _vinted_fr_session=([a-fA-F0-9]{128})', line)
+        datadome_match = re.search(r'Set-Cookie: datadome=([a-zA-Z0-9_\-\.]{50,})', line)
+
+        if session_match:
+            self.cookies['VINTED_SESSION_COOKIE'] = session_match.group(1)
+            logging.info(f"🔧 Mitmdump detected session cookie: {session_match.group(1)[:15]}...")
+
+        if datadome_match:
+            self.cookies['DATADOME_COOKIE'] = datadome_match.group(1)
+            logging.info(f"🔧 Mitmdump detected datadome cookie: {datadome_match.group(1)[:15]}...")
+
+        auth_match = re.search(r'Authorization: (Bearer [a-zA-Z0-9_\-\.=]{10,})', line)
+        if auth_match:
+            self.cookies['AUTHORIZATION'] = auth_match.group(1)
+            logging.info("🔧 Detected Authorization header")
+
+        if self.cookies.get('VINTED_SESSION_COOKIE') and self.cookies.get('DATADOME_COOKIE'):
+            self.found_cookies.set()
+
+    def save_logs(self):
+        if not self.log_buffer:
+            return None
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(MITM_LOG_DIR, f"mitm_{timestamp}.log")
+
+        try:
+            with open(log_path, 'w', encoding='utf-8') as f:
+                f.write("\n".join(self.log_buffer))
+            logging.info(f"📁 MITMProxy logs archived: {log_path}")
+            return log_path
+        except Exception as e:
+            logging.error(f"Failed to save MITM logs: {str(e)}")
+            return None
+
+    def stop(self):
+        self.stop_event.set()
+        return self.save_logs()
+
+def run_adb(args, timeout=10, retries=3):
+    base_cmd = [ADB]
+    if ADB_DEVICE:
+        base_cmd.extend(["-s", ADB_DEVICE])
+
+    for attempt in range(1, retries + 1):
+        try:
+            result = subprocess.run(
+                base_cmd + args,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=True
+            )
+            return result.stdout.strip()
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            logging.warning(f"ADB attempt {attempt}/{retries} failed: {str(e)}")
+            if attempt < retries:
+                time.sleep(2)
+            else:
+                logging.error(f"ADB command failed after {retries} attempts")
+                return ""
+
+def adb_su_command(command, max_attempts=3):
+    """Execute ADB command with root privileges"""
+    base_cmd = [ADB]
+    if ADB_DEVICE:
+        base_cmd.extend(["-s", ADB_DEVICE])
+    base_cmd.extend(["shell", "su", "-c", f'"{command}"'])
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = subprocess.run(
+                base_cmd,
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+            if result.returncode == 0 and "not found" not in result.stderr:
+                return result.stdout.strip()
+            logging.warning(f"SU attempt {attempt} failed: {result.stderr.strip()}")
+        except Exception as e:
+            logging.warning(f"SU command exception: {str(e)}")
+        time.sleep(2)
+    return ""
+
+def terminate_processes(names):
+    system = platform.system()
+    try:
+        if system == "Windows":
+            for name in names:
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", f"{name}.exe"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+        elif system in ["Linux", "Darwin"]:
+            for name in names:
+                subprocess.run(
+                    ["pkill", "-9", "-f", name],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+        logging.info(f"Terminated {len(names)} processes")
+    except Exception as e:
+        logging.error(f"Termination failed: {str(e)}")
+
+def configure_android_proxy(enable=True):
+    target_value = f"{MITM_HOST}:{MITM_PORT}" if enable else ":0"
+    action = "enable" if enable else "disable"
+
+    logging.info(f"🔧 Starting proxy {action} sequence")
+
+    for method in ['non-root', 'root']:
+        for attempt in range(1, 4):
+            if method == 'non-root':
+                cmd = ["shell", "settings", "put", "global", "http_proxy", f"{target_value}"]
+                result = run_adb(cmd)
+            else:  # root
+                result = adb_su_command(f"settings put global http_proxy {target_value}")
+
+            current_proxy = run_adb(["shell", "settings get global http_proxy"])
+            if current_proxy == target_value:
+                logging.info(f"✅ Proxy verification successful ({method})")
+                return True
+
+            logging.warning(f"Proxy mismatch: Expected '{target_value}', got '{current_proxy}'")
+            time.sleep(2)
+
+    logging.error(f"❌ All proxy {action} methods failed")
+    return False
+
+def clear_app_data():
+    logging.info("🧹 Clearing app data")
+    try:
+        run_adb(["shell", "pm", "clear", APP_PACKAGE])
+        logging.info("✅ App data cleared")
+        return True
+    except Exception as e:
+        logging.error(f"Failed to clear app data: {str(e)}")
+        return False
+
+def start_frida_server():
+    logging.info("🛡️ Starting frida-server")
+    try:
+        # Check if frida-server is already running
+        output = adb_su_command("ps -A | grep frida-server")
+        if "frida-server" in output:
+            # Extract PID
+            pid_match = re.search(r'(\d+)\s.*frida-server', output)
+            if pid_match:
+                pid = pid_match.group(1)
+                logging.info(f"✅ frida-server already running (PID: {pid})")
+            else:
+                logging.info("✅ frida-server already running")
+            return True
+
+        # Set permissions and start
+        adb_su_command("chmod 755 /data/local/tmp/frida-server")
+        adb_su_command("setenforce 0")
+        adb_su_command("/data/local/tmp/frida-server &")
+        time.sleep(5)
+
+        # Verify again
+        output = adb_su_command("ps -A | grep frida-server")
+        if "frida-server" in output:
+            pid_match = re.search(r'(\d+)\s.*frida-server', output)
+            if pid_match:
+                pid = pid_match.group(1)
+                logging.info(f"✅ frida-server started (PID: {pid})")
+            else:
+                logging.info("✅ frida-server started")
+            return True
+
+        logging.error("❌ frida-server failed to start")
+        return False
+    except Exception as e:
+        logging.error(f"frida-server start failed: {str(e)}")
+        return False
+
+def start_mitmdump():
+    if NO_MITM:
+        logging.info("⏩ Skipping mitmdump (--no-mitm mode)")
+        return None
+
+    logging.info("🚀 Starting mitmdump")
+    try:
+        mitm_process = subprocess.Popen(
+            [MITMPROXY, "-p", str(MITM_PORT), "--ssl-insecure"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT
+        )
+        time.sleep(5)
+        return mitm_process
+    except Exception as e:
+        logging.error(f"mitmdump failed: {str(e)}")
+        return None
+
+def get_fernet():
+    if not os.path.exists(KEY_FILE):
+        key = Fernet.generate_key()
+        with open(KEY_FILE, "wb") as f:
+            f.write(key)
+        logging.info("🔑 Encryption key generated")
+    else:
+        with open(KEY_FILE, "rb") as f:
+            key = f.read()
+    return Fernet(key)
+
+fernet = get_fernet()
+
+def save_cookies(cookies):
+    if not cookies.get('VINTED_SESSION_COOKIE') or not cookies.get('DATADOME_COOKIE'):
+        logging.warning("⚠️ Incomplete cookies set for saving")
+        return False
+
+    session_cookie = cookies['VINTED_SESSION_COOKIE']
+    datadome_cookie = cookies['DATADOME_COOKIE']
+    timestamp = int(time.time())
+
+    # .env format
+    env_content = f"VINTED_SESSION_COOKIE={session_cookie}\nDATADOME_COOKIE={datadome_cookie}\n"
+
+    for key, value in cookies.items():
+        if key not in ['VINTED_SESSION_COOKIE', 'DATADOME_COOKIE']:
+            env_content += f"{key}={value}\n"
+
+    env_content += f"# Generated: {timestamp}"
+
+    try:
+        with open(COOKIES_FILE, "w") as f:
+            f.write(env_content)
+        os.chmod(COOKIES_FILE, 0o600)
+        logging.info(f"🔒 Cookies saved to {COOKIES_FILE}")
+    except Exception as e:
+        logging.error(f"Error saving cookies: {str(e)}")
+
+    # JSON format
+    json_content = {
+        "vinted_session": session_cookie,
+        "datadome": datadome_cookie,
+        "additional_tokens": {k:v for k,v in cookies.items()
+                              if k not in ['VINTED_SESSION_COOKIE', 'DATADOME_COOKIE']},
+        "generated_at": timestamp,
+        "expires_at": timestamp + 3600
+    }
+
+    try:
+        with open(COOKIES_JSON, "w") as f:
+            json.dump(json_content, f, indent=2)
+        logging.info(f"📝 Cookies saved to {COOKIES_JSON}")
+    except Exception as e:
+        logging.error(f"Error saving JSON cookies: {str(e)}")
+
+    archive_cookies(env_content)
+    return True
+
+def archive_cookies(content):
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    archive_path = os.path.join(ARCHIVE_DIR, f"cookies_{timestamp}.env")
+
+    try:
+        encrypted_content = fernet.encrypt(content.encode())
+        with open(archive_path, "wb") as f:
+            f.write(encrypted_content)
+        logging.info(f"🗄️ Cookies archived to {archive_path}")
+    except Exception as e:
+        logging.error(f"Archive failed: {str(e)}")
+
+# Improved cookie validation
+def validate_cookies(session_cookie, datadome_cookie):
+    """Enhanced cookie validation"""
+    if not re.fullmatch(r'[a-f0-9]{128}', session_cookie):
+        logging.error("INVALID SESSION FORMAT")
+        return False
+
+    if not re.fullmatch(r'[a-zA-Z0-9\-_]{50,}', datadome_cookie):
+        logging.error("INVALID DATADOME FORMAT")
+        return False
+
+    return True
+
+def test_proxy_setup():
+    print("\n=== PROXY VALIDATION SUITE ===")
+
+    print("[TEST] Proxy disable (non-root)...")
+    if configure_android_proxy(False):
+        print("[✅] Disable successful (non-root)")
+    else:
+        print("[❌] Disable failed (non-root)")
+
+    print("[TEST] Proxy disable (root fallback)...")
+    if adb_su_command("settings put global http_proxy :0"):
+        print("[✅] Disable successful (root)")
+    else:
+        print("[❌] Disable failed (root)")
+
+    print("\n[TEST] Proxy enable (non-root)...")
+    if configure_android_proxy(True):
+        print("[✅] Enable successful (non-root)")
+    else:
+        print("[❌] Enable failed (non-root)")
+
+    print("[TEST] Proxy enable (root fallback)...")
+    if adb_su_command(f"settings put global http_proxy {MITM_HOST}:{MITM_PORT}"):
+        print("[✅] Enable successful (root)")
+    else:
+        print("[❌] Enable failed (root)")
+
+    current = run_adb(["shell", "settings get global http_proxy"])
+    print(f"\n[FINAL] Current proxy: {current}")
+    print("=== TEST COMPLETE ===\n")
+    return ":0" not in current
+
+def archive_all_logs(frida_log_paths, mitm_log_paths):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_name = f"vinted_logs_{timestamp}.zip"
+
+    try:
+        with zipfile.ZipFile(archive_name, 'w') as zipf:
+            for log_path in frida_log_paths:
+                if log_path and os.path.exists(log_path):
+                    zipf.write(log_path, os.path.basename(log_path))
+
+            for log_path in mitm_log_paths:
+                if log_path and os.path.exists(log_path):
+                    zipf.write(log_path, os.path.basename(log_path))
+
+            raw_log = os.path.join(FRIDA_LOG_DIR, "frida_raw.log")
+            if os.path.exists(raw_log):
+                zipf.write(raw_log, "frida_raw.log")
+
+        logging.info(f"📦 All logs archived to {archive_name}")
+        return archive_name
+    except Exception as e:
+        logging.error(f"Failed to create log archive: {str(e)}")
+        return None
+
+def disable_usap():
+    """Disable USAP for WSA stability"""
+    logging.info("🔧 Disabling USAP for WSA stability")
+    try:
+        adb_su_command("setprop persist.wsa.usap.enable 0")
+        logging.info("✅ USAP disabled")
+        return True
+    except Exception as e:
+        logging.error(f"Failed to disable USAP: {str(e)}")
+        return False
+
+def disable_android_security():
+    """Disable Android security features"""
+    logging.info("🛡️ Disabling Android security features")
+    try:
+        adb_su_command("setenforce 0")
+        adb_su_command("settings put global hidden_api_policy 1")
+        adb_su_command("settings put global verifier_verify_adb_installs 0")
+        logging.info("✅ Android security features disabled")
+        return True
+    except Exception as e:
+        logging.error(f"Failed to disable security features: {str(e)}")
+        return False
+
+def prevent_wsa_freezes():
+    """Techniques to stabilize WSA"""
+    logging.info("⚙️ Applying WSA anti-freeze measures")
+    adb_su_command("settings put global window_animation_scale 0")
+    adb_su_command("settings put global transition_animation_scale 0")
+    adb_su_command("settings put global animator_duration_scale 0")
+    adb_su_command("am broadcast -a android.intent.action.BOOT_COMPLETED")
+    return True
+
+def inject_child_process(pid, handler):
+    """Injecte Frida dans les processus enfants"""
+    try:
+        logging.info(f"💉 Injecting to child process {pid}")
+        device = frida.get_usb_device()
+        session = device.attach(int(pid))
+
+        with open(FRIDA_SCRIPT, 'r', encoding='utf-8') as f:
+            script_code = f.read()
+
+        script = session.create_script(script_code)
+        script.on('message', handler.on_message)
+        script.load()
+        logging.info(f"✅ Injected to child {pid}")
+    except Exception as e:
+        logging.error(f"Child injection failed: {str(e)}")
+
+def wait_for_java_environment(handler, pid, timeout=FRIDA_JAVA_TIMEOUT):
+    """Nouveau système de monitoring JVM avec détection de fork"""
+    logging.info(f"🔬 Starting JVM Inspector (timeout: {timeout}s)")
+    start_time = time.time()
+    last_status = start_time
+    children_detected = set()
+
+    while time.time() - start_time < timeout:
+        # Vérifier les processus enfants
+        children_output = run_adb(["shell", "ps", "-o", "PID,PPID,CMD"])
+        for line in children_output.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[1] == str(pid):
+                child_pid = parts[0]
+                if child_pid not in children_detected:
+                    logging.info(f"👶 Child process detected: {child_pid} ({' '.join(parts[2:])})")
+                    children_detected.add(child_pid)
+
+                    # Injecter dans le processus enfant
+                    if USE_MULTI_PROCESS:
+                        threading.Thread(
+                            target=inject_child_process,
+                            args=(child_pid, handler)
+                        ).start()
+
+        # Vérifier l'état Java
+        if handler.java_ready_event.is_set():
+            logging.info("🎯 Java environment READY")
+            return True
+
+        if handler.java_error_event.is_set():
+            logging.warning("⚠️ Java reference error - switching to child process mode")
+            handler.java_error_event.clear()
+            USE_MULTI_PROCESS = True
+
+        # Vérifier si l'app est toujours en vie
+        output = run_adb(["shell", "ps", "-A"])
+        if str(pid) not in output:
+            logging.error("💥 Main process crashed - switching to children")
+            return any(str(pid) in output for pid in children_detected)
+
+        # Log toutes les 15 secondes
+        if time.time() - last_status > 15:
+            elapsed = int(time.time() - start_time)
+            java_status = "NOT_READY"
+            if hasattr(handler, 'java_status'):
+                java_status = handler.java_status
+            logging.info(f"⏳ JVM Status: {java_status} | {elapsed}s | Children: {len(children_detected)}")
+            last_status = time.time()
+
+        time.sleep(2)
+
+    logging.error(f"⌛ Timeout: Java not ready after {timeout}s")
+    return False
+
+# === MAIN EXECUTION ===
+def main():
+    frida_handler = None
+    mitm_process = None
+    mitm_reader = None
+    attempt_count = 0
+    max_attempts = 3
+    base_timeout = TIMEOUT
+    frida_session = None
+    frida_device = None
+    script = None
+    frida_log_paths = []
+    mitm_log_paths = []
+    pid = None
+
+    try:
+        # === WSA AUTOMATION BLOCK ===
+        if platform.system() == "Windows":
+            # Launch WSA subsystem
+            logging.info("🚀 Launching WSA subsystem")
+            try:
+                subprocess.run(
+                    ["powershell", "-Command", "Start-Process 'wsa://'"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True
+                )
+                logging.info("🟢 WSA launch command executed")
+            except Exception as e:
+                logging.warning(f"WSA protocol launch failed: {str(e)}")
+                try:
+                    run_adb(["shell", "am", "start", "-a", "android.settings.SETTINGS"])
+                    logging.info("⚠️ Used fallback method: Launched Android Settings")
+                except Exception as fallback_error:
+                    logging.error(f"Fallback WSA activation failed: {str(fallback_error)}")
+
+            # Launch WSAClient
+            logging.info("🚀 Launching WSAClient")
+            wsa_client_paths = [
+                "WSAClient.exe",
+                os.path.expandvars(r"%ProgramFiles%\WindowsApps\*WindowsSubsystemForAndroid*\WSAClient.exe"),
+                os.path.expandvars(r"%LocalAppData%\Microsoft\WindowsApps\WSAClient.exe")
+            ]
+
+            launched = False
+            for path in wsa_client_paths:
+                expanded_paths = glob.glob(path)
+                if expanded_paths:
+                    try:
+                        subprocess.Popen(
+                            expanded_paths,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL
+                        )
+                        logging.info(f"🟢 WSAClient started: {expanded_paths[0]}")
+                        launched = True
+                        break
+                    except Exception as e:
+                        logging.warning(f"WSAClient launch failed for {path}: {str(e)}")
+
+            if not launched:
+                logging.error("❌ WSAClient not found in standard locations")
+
+            # Apply anti-freeze measures
+            prevent_wsa_freezes()
+
+            # Initialization pause
+            logging.info(f"⏳ Waiting for WSA to initialize ({WSA_INIT_TIMEOUT}s)...")
+            time.sleep(WSA_INIT_TIMEOUT)
+        else:
+            logging.info("⏩ Skipping WSA launch (non-Windows system)")
+
+        # === ADB CONNECTION PROTOCOL ===
+        logging.info("🔌 Initializing WSA connection protocol")
+
+        # ADB server management
+        try:
+            subprocess.run([ADB, "kill-server"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run([ADB, "start-server"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            logging.info("🔄 ADB server reset completed")
+        except Exception as e:
+            logging.error(f"ADB server management failed: {str(e)}")
+            return False
+
+        # Connection protocol
+        connected = False
+        for attempt in range(1, 5):
+            try:
+                result = subprocess.run(
+                    [ADB, "connect", WSA_ADDRESS],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                logging.info(f"📡 Connection status: {result.stdout.strip()}")
+
+                devices_output = subprocess.run(
+                    [ADB, "devices"],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                ).stdout
+
+                if WSA_ADDRESS in devices_output and "device" in devices_output:
+                    logging.info(f"✅ WSA device authenticated: {WSA_ADDRESS}")
+                    connected = True
+                    break
+                else:
+                    logging.warning(f"🚧 Device not ready (attempt {attempt}/4)")
+            except Exception as e:
+                logging.warning(f"Connection attempt {attempt}/4 failed: {str(e)[:70]}")
+
+            time.sleep(3)
+
+        if not connected:
+            logging.error("🚨 WSA connection failed. Validate WSA status and retry.")
+            return False
+
+        # === AUTO-RETRY LOOP ===
+        cookies_found = False
+        collected_cookies = {}
+
+        # Disable security features
+        if platform.system() == "Windows":
+            disable_usap()
+            disable_android_security()
+
+        while attempt_count < max_attempts and not cookies_found:
+            attempt_count += 1
+            logging.info(f"🔄 Starting attempt {attempt_count}/{max_attempts}")
+
+            # Clean previous session
+            clear_app_data()
+            terminate_processes(["mitmdump", "mitmproxy", "frida"])
+            configure_android_proxy(False)
+            time.sleep(3)
+
+            # Start frida-server
+            if not start_frida_server():
+                logging.error("❌ frida-server initialization failed")
+                continue
+
+            # === ADVANCED FRIDA WORKFLOW ===
+            try:
+                # Get USB device
+                frida_device = frida.get_usb_device(timeout=10)
+
+                # Check if app is already running
+                try:
+                    app = frida_device.get_process(APP_PACKAGE)
+                    if app:
+                        logging.warning(f"⚠️ App already running with PID {app.pid}, killing it")
+                        run_adb(["shell", "am", "force-stop", APP_PACKAGE])
+                        time.sleep(2)
+                except frida.ProcessNotFoundError:
+                    pass
+
+                # Launch app in suspended state
+                pid = None
+                for spawn_attempt in range(1, MAX_SPAWN_RETRIES + 1):
+                    try:
+                        pid = frida_device.spawn([APP_PACKAGE])
+                        logging.info(f"✅ App spawned with PID {pid} (attempt {spawn_attempt}/{MAX_SPAWN_RETRIES})")
+                        break
+                    except frida.ProcessNotFoundError:
+                        if spawn_attempt < MAX_SPAWN_RETRIES:
+                            logging.warning(f"App spawn failed, retrying in 4s...")
+                            time.sleep(4)
+                        else:
+                            raise
+
+                # Connect to the process
+                frida_session = frida_device.attach(pid)
+                logging.info("✅ Frida session attached before app start")
+
+                # Initialize message handler
+                frida_handler = FridaMessageHandler()
+
+                # Load bypass script
+                with open(FRIDA_SCRIPT, 'r', encoding='utf-8') as f:
+                    script_code = f.read()
+
+                script = frida_session.create_script(script_code)
+                script.on('message', frida_handler.on_message)
+
+                # Inject script before resuming
+                script.load()
+                logging.info("✅ SSL bypass script loaded")
+                logging.info("[INFO] ✅ Script Frida injecté")
+
+                # Crucial delay before resume
+                time.sleep(2)
+
+                # Resume after injection
+                frida_device.resume(pid)
+                logging.info("[INFO] ✅ App resumed")
+
+                # === IMPROVED JAVA ENVIRONMENT WAIT ===
+                if not wait_for_java_environment(frida_handler, pid):
+                    logging.error("💥 Java environment initialization failed - retrying")
+                    run_adb(["shell", "am", "force-stop", APP_PACKAGE])
+                    time.sleep(5)
+                    continue
+
+                # Watchdog to check if app is still alive
+                logging.info("🔍 Starting app watchdog")
+                watchdog_timeout = 20  # seconds
+                watchdog_start = time.time()
+                app_running = True
+
+                while time.time() - watchdog_start < watchdog_timeout:
+                    output = run_adb(["shell", "ps", "-A"])
+                    if str(pid) in output:
+                        logging.info(f"✅ App still running (PID: {pid})")
+                        time.sleep(2)
+                    else:
+                        app_running = False
+                        logging.error(f"❌ App process (PID: {pid}) crashed!")
+                        break
+
+                if not app_running:
+                    logging.error("💥 App crashed after launch, retrying...")
+                    continue
+
+                # Wait for app initialization
+                logging.info("⏳ Waiting for app to initialize (5s)...")
+                time.sleep(5)
+
+                # === AUTOMATED LOGIN SEQUENCE ===
+                logging.info("==================================================================")
+                logging.info("🔄 AUTOMATED LOGIN SEQUENCE INITIATED")
+                logging.info("⚠️ DO NOT INTERACT WITH THE DEVICE UNTIL NOTIFIED")
+
+                # Phase 1: Launch login activity
+                run_adb([
+                    "shell", "am", "start", "-n",
+                    "fr.vinted/com.vinted.android.login.ui.onboarding.OnboardingActivity"
+                ])
+                time.sleep(8)
+
+                # Phase 2: Auto-enter credentials
+                vinted_user = os.getenv("VINTED_USER")
+                vinted_pass = os.getenv("VINTED_PASS")
+                if vinted_user and vinted_pass:
+                    run_adb(["shell", "input", "text", vinted_user])
+                    time.sleep(1)
+                    run_adb(["shell", "input", "keyevent", "61"])  # Tab
+                    time.sleep(1)
+                    run_adb(["shell", "input", "text", vinted_pass])
+                    time.sleep(1)
+                    run_adb(["shell", "input", "keyevent", "66"])  # Enter
+                    logging.info("✅ Login sequence completed")
+                else:
+                    logging.error("❌ VINTED_USER or VINTED_PASS not set in .env")
+                    # Fallback to manual if credentials are missing
+                    logging.info("==================================================================")
+                    logging.info("⏳ PLEASE MANUALLY LOG IN (credentials not set in .env)")
+                    logging.info("⏳ Complete any CAPTCHA challenges then press ENTER")
+                    logging.info("==================================================================")
+                    input()
+
+            except Exception as e:
+                logging.error(f"Frida spawn sequence failed: {str(e)}")
+                if pid:
+                    run_adb(["shell", "am", "force-stop", APP_PACKAGE])
+                    logging.info("🛑 Force-stopped app after failed spawn sequence")
+                continue
+
+            # === PROXY CONFIGURATION ===
+            if not NO_MITM:
+                mitm_process = start_mitmdump()
+                if mitm_process:
+                    mitm_reader = MitmOutputReader(mitm_process)
+                    mitm_reader.start()
+                    logging.info("👂 MITMProxy monitoring started")
+                else:
+                    logging.error("❌ MITMProxy failed to start")
+
+                if configure_android_proxy(True):
+                    logging.info("✅ Proxy configured successfully")
+                else:
+                    logging.error("❌ Proxy configuration failed")
+            else:
+                logging.info("⏩ Skipping proxy (--no-mitm mode)")
+
+            # === COOKIE EXTRACTION PHASE ===
+            start_time = time.time()
+            token_timeout = 30
+            dynamic_timeout = base_timeout
+            partial_progress = False
+            last_status = time.time()
+
+            logging.info(f"⏳ Waiting for initial tokens ({token_timeout}s)...")
+            time.sleep(token_timeout)
+
+            logging.info(f"⏳ Cookie extraction started (timeout: {dynamic_timeout}s)")
+
+            while time.time() - start_time < dynamic_timeout:
+                if time.time() - last_status > 30:
+                    elapsed = int(time.time() - start_time)
+                    logging.info(f"⏱️ Monitoring... ({elapsed}s elapsed)")
+                    last_status = time.time()
+
+                # Check cookies via Frida
+                session = frida_handler.collected_cookies.get('VINTED_SESSION_COOKIE')
+                datadome = frida_handler.collected_cookies.get('DATADOME_COOKIE')
+
+                if session and datadome and validate_cookies(session, datadome):
+                    logging.info("✅ Valid cookies extracted via Frida")
+                    collected_cookies = frida_handler.collected_cookies
+                    cookies_found = True
+                    break
+
+                # Check cookies via mitmdump
+                if mitm_reader and mitm_reader.found_cookies.is_set():
+                    session = mitm_reader.cookies.get('VINTED_SESSION_COOKIE')
+                    datadome = mitm_reader.cookies.get('DATADOME_COOKIE')
+
+                    if session and datadome and validate_cookies(session, datadome):
+                        logging.info("✅ Valid cookies extracted via MITM")
+                        collected_cookies = mitm_reader.cookies
+                        cookies_found = True
+                        break
+
+                # Adaptive timeout extension
+                if not partial_progress:
+                    has_session = 'VINTED_SESSION_COOKIE' in frida_handler.collected_cookies
+                    has_datadome = 'DATADOME_COOKIE' in frida_handler.collected_cookies
+
+                    if (has_session and not has_datadome) or (has_datadome and not has_session):
+                        logging.info("⏱️ Partial detection - extending timeout by 30s")
+                        dynamic_timeout += 30
+                        partial_progress = True
+
+                time.sleep(1)
+
+            # Final cookie processing
+            if cookies_found:
+                save_cookies(collected_cookies)
+                break
+            else:
+                logging.warning("⏱️ Timeout reached - triggering auto-retry")
+                if mitm_reader:
+                    mitm_reader.stop()
+                run_adb(["shell", "am", "force-stop", APP_PACKAGE])
+                time.sleep(3)
+
+        # Final status
+        if cookies_found:
+            return True
+        else:
+            logging.error("❌ All attempts failed - no valid cookies captured")
+            return False
+
+    except Exception as e:
+        logging.critical(f"🚨 Critical failure: {str(e)}")
+        return False
+
+    finally:
+        # === CLEANUP SEQUENCE ===
+        logging.info("🚧 Cleaning up resources...")
+
+        if frida_handler:
+            log_path = frida_handler.stop()
+            if log_path:
+                frida_log_paths.append(log_path)
+
+        if mitm_reader:
+            log_path = mitm_reader.stop()
+            if log_path:
+                mitm_log_paths.append(log_path)
+            mitm_reader.join(timeout=1.0)
+
+        if script:
+            try:
+                script.unload()
+                logging.info("🛑 Frida script unloaded")
+            except Exception as e:
+                logging.error(f"Script unload failed: {str(e)}")
+
+        if frida_session:
+            try:
+                frida_session.detach()
+                logging.info("🛑 Frida session detached")
+            except Exception as e:
+                logging.error(f"Session detach failed: {str(e)}")
+
+        if mitm_process:
+            mitm_process.terminate()
+
+        terminate_processes(["mitmdump", "mitmproxy", "frida"])
+
+        configure_android_proxy(False)
+
+        run_adb(["shell", "am", "force-stop", APP_PACKAGE])
+
+        archive_all_logs(frida_log_paths, mitm_log_paths)
+
+        logging.info("🛑 Sniffing stopped")
+
+if __name__ == "__main__":
+    if "--test-proxy" in sys.argv:
+        test_proxy_setup()
+    else:
+        if "--simulate" in sys.argv:
+            handler = FridaMessageHandler()
+            test_msg = {'type': 'send', 'payload': {'key': 'datadome', 'value': 'test_cookie_value'}}
+            handler.on_message(test_msg, None)
+            print("Simulation completed")
+            sys.exit(0)
+
+        success = main()
+        if success:
+            logging.info("🎉 Sniffing completed successfully!")
+            sys.exit(0)
+        else:
+            logging.error("💥 Sniffing failed")
+            sys.exit(1)
