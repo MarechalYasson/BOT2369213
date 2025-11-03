@@ -1,0 +1,1245 @@
+// Vinted Ghost Protocol Elite v13.1 - Enhanced JVM Detection
+// Optimisé pour les mécanismes Vinted (cookies, sessions, API)
+// Système JVM Warfare - Injection Multi-processus & Hooking Différé
+
+// ===== CONFIGURATION =====
+const GHOST_CONFIG = {
+    STEALTH_MODE: true,
+    MAX_BODY_SCAN: 51200,
+    TOKEN_PATTERNS: [
+        /vinted_fr_session=[a-f0-9]{128}/,
+        /vt_auth=[a-f0-9]{40,}/,
+        /(eyJ[a-zA-Z0-9_-]{15,}\.[a-zA-Z0-9_-]{15,}\.[a-zA-Z0-9_-]{15,})/,
+        /vte?_[a-f0-9]{20,}/,
+        /datadome=[a-zA-Z0-9\-\_]{50,}/
+    ],
+    CRITICAL_ENDPOINTS: [
+        "/api/v2/auth/token",
+        "/api/v2/sessions",
+        "/api/v2/users/web_profiling",
+        "/basket",
+        "/token",
+        "/oauth"
+    ],
+    DATADOME_TRIGGERS: [
+        "challenge-platform",
+        "cdn-cgi/challenge-platform",
+        "datadome.co"
+    ],
+    BATCH_INTERVAL: 200,
+    CRYPTO_HOOK_THRESHOLD: 128,
+    KEYSTORE_ALIASES: ["vinted_", "datadome_", "private_key_"],
+    DEBUG: true,
+    SESSION_REFRESH_TIMEOUT: 240000, // 4 minutes
+    VAULT_PATH: "/sdcard/ghost_vault.json",
+    PROXY_HOST: "127.0.0.1",
+    PROXY_PORT: 8080,
+    JAVA_INIT_RETRY_DELAY: 3000,
+    JAVA_INIT_MAX_ATTEMPTS: 15,  // Augmenté de 5 à 15
+    CHILD_PROCESS_CHECK_INTERVAL: 2000  // Nouveau
+};
+
+// ==== JVM WARFARE SYSTEM ====
+let JVM_STATUS = "INIT";
+const HOOK_PHASES = {
+    PHASE_1: ['javax.net.ssl', 'android.webkit'],
+    PHASE_2: ['okhttp3', 'java.net'],
+    PHASE_3: ['android.content', 'android.security']
+};
+
+// ==== STRUCTURED LOGGING SYSTEM =====
+function sendLog(event, type, data) {
+    const logEntry = {
+        event: event,
+        type: type,
+        timestamp: Date.now(),
+        pid: Process.id,
+        data: data
+    };
+    
+    // Fallback JS natif si Java n'est pas disponible
+    try {
+        send(JSON.stringify(logEntry));
+        if (GHOST_CONFIG.DEBUG) console.log(JSON.stringify(logEntry));
+    } catch (e) {
+        console.log(`[JS_FALLBACK] ${type}:${event} - ${JSON.stringify(data)}`);
+    }
+}
+
+// ==== ENHANCED JVM MONITORING ====
+setInterval(() => {
+    try {
+        let javaStatus = "UNAVAILABLE";
+        let javaType = "undefined";
+        
+        if (typeof Java !== 'undefined') {
+            javaType = "object";
+            javaStatus = Java.available ? "READY" : "UNAVAILABLE";
+            JVM_STATUS = javaStatus;
+        } else {
+            javaType = "undefined";
+            JVM_STATUS = "NOT_DEFINED";
+        }
+        
+        sendLog("JVM_STATUS", "DEBUG", {
+            status: JVM_STATUS,
+            javaType: javaType,
+            pid: Process.id,
+            children: childProcesses.size
+        });
+        
+    } catch (e) {
+        JVM_STATUS = "CRASHED";
+        sendLog("JVM_STATUS", "ERROR", {
+            error: e.message,
+            stack: e.stack
+        });
+    }
+}, 3000);  // Réduit à 3s
+
+// ==== ENHANCED JVM DETECTION ====
+let jvmCheckAttempts = 0;
+const MAX_JVM_CHECKS = GHOST_CONFIG.JAVA_INIT_MAX_ATTEMPTS;
+
+function monitorJvm() {
+    sendLog("JVM_MONITOR_ATTEMPT", "DEBUG", {
+        attempt: jvmCheckAttempts,
+        max: MAX_JVM_CHECKS
+    });
+    
+    if (typeof Java !== 'undefined' && Java.available) {
+        Java.perform(() => {
+            sendLog("JAVA_ENV_ACTIVATED", "SUCCESS", {
+                pid: Process.id,
+                time: Date.now()
+            });
+            applyDelayedHooks();
+        });
+        return;
+    }
+    
+    if (jvmCheckAttempts++ >= MAX_JVM_CHECKS) {
+        sendLog("JAVA_INIT_FAILURE", "CRITICAL", {
+            reason: "Max attempts reached",
+            pid: Process.id
+        });
+        return;
+    }
+    
+    const delay = Math.min(
+        1000 * Math.pow(1.5, jvmCheckAttempts), 
+        15000
+    );
+    
+    setTimeout(monitorJvm, delay);
+}
+
+// ==== DELAYED HOOKING SYSTEM ====
+function applyDelayedHooks() {
+    // Phase 1 - Hooks critiques immédiats (SSL/WebView)
+    applyHooksForPhase(HOOK_PHASES.PHASE_1);
+    
+    // Phase 2 - Hooks réseau différés
+    setTimeout(() => {
+        applyHooksForPhase(HOOK_PHASES.PHASE_2);
+        
+        // Phase 3 - Hooks de sécurité (après 20s)
+        setTimeout(() => {
+            applyHooksForPhase(HOOK_PHASES.PHASE_3);
+            sendLog("HOOK_PHASES_COMPLETE", "INFO", {pid: Process.id});
+        }, 20000);
+    }, 10000);
+}
+
+function applyHooksForPhase(packages) {
+    packages.forEach(pkg => {
+        try {
+            Java.enumerateLoadedClasses({
+                onMatch: function(className) {
+                    if (className.startsWith(pkg)) {
+                        hookManager.registerHook(className, '*', genericHook);
+                    }
+                },
+                onComplete: function() {}
+            });
+        } catch (e) {
+            sendLog("HOOK_PHASE_ERROR", "ERROR", {phase: pkg, error: e.message});
+        }
+    });
+}
+
+// ==== GENERIC HOOK HANDLER ====
+function genericHook() {
+    const className = this.getClass().getName();
+    const methodName = getCurrentMethod();
+    
+    // Envoyer seulement 1% des appels pour éviter le flood
+    if (Math.random() < 0.01) {
+        sendLog("HOOK_ACTIVE", "DEBUG", {
+            class: className,
+            method: methodName,
+            pid: Process.id
+        });
+    }
+    
+    return this[methodName].apply(this, arguments);
+}
+
+function getCurrentMethod() {
+    const stack = Thread.backtrace(this.context, Backtracer.ACCURATE);
+    if (stack.length > 0) {
+        const frame = DebugSymbol.fromAddress(stack[0]);
+        return frame.name || "unknown_method";
+    }
+    return "unknown_method";
+}
+
+// ==== JAVA HOOK MANAGER (ENHANCED) ====
+class JavaHookManager {
+    constructor() {
+        this.hooks = [];
+        this.attemptCount = 0;
+    }
+
+    registerHook(targetClass, method, implementation) {
+        this.hooks.push({targetClass, method, implementation});
+    }
+
+    applyHooks() {
+        this.hooks.forEach(hook => {
+            try {
+                const cls = Java.use(hook.targetClass);
+                
+                if (hook.method === '*') {
+                    // Hook all methods
+                    const methods = cls.class.getDeclaredMethods();
+                    methods.forEach(m => {
+                        const methodName = m.getName();
+                        try {
+                            cls[methodName].implementation = hook.implementation;
+                            sendLog("HOOK_APPLIED", "DEBUG", {
+                                class: hook.targetClass,
+                                method: methodName
+                            });
+                        } catch (e) {
+                            // Ignore non-hookable methods
+                        }
+                    });
+                } else {
+                    // Single method hook
+                    cls[hook.method].implementation = hook.implementation;
+                    sendLog("HOOK_APPLIED", "DEBUG", {
+                        class: hook.targetClass,
+                        method: hook.method
+                    });
+                }
+            } catch (e) {
+                sendLog("HOOK_ERROR", "ERROR", {
+                    class: hook.targetClass,
+                    method: hook.method,
+                    error: e.message
+                });
+            }
+        });
+    }
+}
+
+// Créer une instance globale
+const hookManager = new JavaHookManager();
+
+// ===== PERSISTENT VAULT SYSTEM =====
+const vaultFilePath = GHOST_CONFIG.VAULT_PATH;
+let VAULT_FILE;
+
+try {
+    const testFile = new File(vaultFilePath, "a+");
+    testFile.close();
+    VAULT_FILE = new File(vaultFilePath, "r+");
+} catch (e) {
+    sendLog("VAULT_FILE_ERROR", "ERROR", {error: e.message});
+    VAULT_FILE = {
+        write: function() {},
+        read: function() { return "{}"; },
+        exists: function() { return false; }
+    };
+}
+
+let sessionVault = {
+    vintedSession: null,
+    authToken: null,
+    datadomeToken: null,
+    lastUpdated: 0
+};
+
+// Load vault from file if exists
+try {
+    if (VAULT_FILE.exists()) {
+        const savedVault = JSON.parse(VAULT_FILE.read());
+        Object.assign(sessionVault, savedVault);
+        sendLog("VAULT_LOAD", "INFO", {status: "SUCCESS", path: GHOST_CONFIG.VAULT_PATH});
+    }
+} catch (e) {
+    sendLog("VAULT_LOAD", "ERROR", {error: e.message});
+}
+
+function saveVault() {
+    try {
+        VAULT_FILE.write(JSON.stringify(sessionVault));
+        sendLog("VAULT_SAVE", "INFO", {status: "SUCCESS"});
+    } catch (e) {
+        sendLog("VAULT_SAVE", "ERROR", {error: e.message});
+    }
+}
+
+// ===== ELITE TOKEN MATRIX =====
+const tokenMatrix = new Map();
+let stealthTimer = null;
+
+function ghostProcessor(source, key, value) {
+    if (!value) return;
+    
+    sendLog("TOKEN_CAPTURE", "INFO", {source, key, value});
+    
+    const isCritical = GHOST_CONFIG.TOKEN_PATTERNS.some(rx => rx.test(value));
+    if (!isCritical) return;
+    
+    const tokenHash = hashString(value.substring(0, 32));
+    if (tokenMatrix.has(tokenHash)) return;
+    
+    tokenMatrix.set(tokenHash, { 
+        source, 
+        key, 
+        value,
+        timestamp: Date.now(),
+        pid: Process.id,
+        context: getCallContext(),
+        stack: getCompactStack()
+    }); 
+    
+    scheduleStealthFlush();
+
+    // Capture Vinted session tokens
+    if (/vinted_fr_session|vt_auth|datadome/.test(key)) {
+        if (value.includes('vinted_fr_session')) {
+            sessionVault.vintedSession = value;
+            sessionVault.lastUpdated = Date.now();
+            saveVault();
+            sendLog("VINTED_SESSION", "INFO", {
+                type: "session", 
+                token: value.substring(0, 15) + '...'
+            });
+        }
+        else if (value.includes('datadome')) {
+            sessionVault.datadomeToken = value;
+            sessionVault.lastUpdated = Date.now();
+            saveVault();
+            sendLog("DATADOME_TOKEN", "INFO", {
+                type: "datadome", 
+                token: value.substring(0, 15) + '...'
+            });
+        }
+    }
+}
+
+// ===== JAVA INITIALIZATION GUARD (AMÉLIORÉ) =====
+function initJavaHooks(attempt = 1) {
+    sendLog("JAVA_INIT_ATTEMPT", "DEBUG", {attempt});
+    
+    if (typeof Java === 'undefined' || !Java.available) {
+        if (attempt < GHOST_CONFIG.JAVA_INIT_MAX_ATTEMPTS) {
+            setTimeout(
+                () => initJavaHooks(attempt + 1), 
+                GHOST_CONFIG.JAVA_INIT_RETRY_DELAY
+            );
+        } else {
+            sendLog("JAVA_INIT_FAILED", "CRITICAL", {
+                max_attempts: GHOST_CONFIG.JAVA_INIT_MAX_ATTEMPTS,
+                pid: Process.id
+            });
+        }
+        return;
+    }
+
+    sendLog("JAVA_INIT_START", "INFO", {attempt});
+
+    // ===== ADVANCED SSL BYPASS SYSTEM =====
+    Java.perform(function() {
+        // ████████ ANDROID KEYSTORE BYPASS
+        try {
+            const AndroidKeyStore = Java.use('android.security.keystore.KeyStore');
+            hookManager.registerHook('android.security.keystore.KeyStore', 'get', function(alias) {
+                sendLog("KEYSTORE_BYPASS", "INFO", {alias: alias});
+                return null;
+            });
+        } catch (e) {
+            sendLog("ANDROID_KEYSTORE_BYPASS_ERROR", "DEBUG", {error: e.message});
+        }
+
+        // ████████ UNIVERSAL SSL CONTEXT HOOK (HTTP Toolkit Inspired)
+        try {
+            const SSLContext = Java.use('javax.net.ssl.SSLContext');
+            
+            // Hook all SSLContext.init overloads
+            const initOverloads = SSLContext.init.overloads;
+            initOverloads.forEach(overload => {
+                hookManager.registerHook('javax.net.ssl.SSLContext', 'init', function(km, tm, sr) {
+                    sendLog("SSL_CONTEXT_INIT", "DEBUG", {
+                        keyManagers: km ? km.length : 0,
+                        trustManagers: tm ? tm.length : 0
+                    });
+                    
+                    // Create custom trust manager that trusts all
+                    const TrustAllManager = Java.registerClass({
+                        name: 'com.ghost.TrustAllManager',
+                        implements: [Java.use('javax.net.ssl.X509TrustManager')],
+                        methods: {
+                            checkClientTrusted: function(chain, authType) {},
+                            checkServerTrusted: function(chain, authType) {},
+                            getAcceptedIssuers: function() { return []; }
+                        }
+                    }).$new();
+                    
+                    return overload.call(this, km, [TrustAllManager], sr);
+                });
+            });
+        } catch (e) {
+            sendLog("SSL_CONTEXT_HOOK_ERROR", "ERROR", {error: e.message});
+        }
+
+        // ████████ HTTPSURLCONNECTION BYPASS
+        try {
+            const HttpsURLConnection = Java.use('javax.net.ssl.HttpsURLConnection');
+            
+            hookManager.registerHook('javax.net.ssl.HttpsURLConnection', 'setSSLSocketFactory', function(factory) {
+                sendLog("SSL_FACTORY_BYPASS", "DEBUG", {factory: factory.toString()});
+            });
+            
+            hookManager.registerHook('javax.net.ssl.HttpsURLConnection', 'setHostnameVerifier', function(verifier) {
+                sendLog("HOSTNAME_VERIFIER_BYPASS", "DEBUG", {verifier: verifier.toString()});
+                // Use verifier that always returns true
+                const TrustAllVerifier = Java.use('javax.net.ssl.HostnameVerifier').$new({
+                    verify: function(hostname, session) { return true; }
+                });
+                this.setHostnameVerifier(TrustAllVerifier);
+            });
+        } catch (e) {
+            sendLog("HTTPSURLCONNECTION_HOOK_ERROR", "ERROR", {error: e.message});
+        }
+
+        // ████████ TRUSTKIT & CERTIFICATE TRANSPARENCY BYPASS
+        try {
+            // TrustKit bypass
+            const TrustKit = Java.use('com.datatheorem.android.trustkit.TrustKit');
+            hookManager.registerHook('com.datatheorem.android.trustkit.TrustKit', 'getInstance', function() {
+                sendLog("TRUSTKIT_BYPASS", "INFO", {});
+                return null;
+            });
+            
+            // Network Security Config bypass
+            const NetworkSecurityConfig = Java.use('android.security.net.config.NetworkSecurityConfig');
+            hookManager.registerHook('android.security.net.config.NetworkSecurityConfig', 'isCleartextTrafficPermitted', function(hostname) {
+                return true;
+            });
+            
+        } catch (e) {
+            sendLog("TRUSTKIT_ERROR", "DEBUG", {error: e.message});
+        }
+
+        // ████████ NATIVE TLS BYPASS (libssl)
+        try {
+            const symbols = Module.enumerateSymbolsSync("libssl.so");
+            const sslCtxFunctions = symbols.filter(s => s.name.includes("SSL_CTX"));
+            
+            sslCtxFunctions.forEach(func => {
+                Interceptor.attach(func.address, {
+                    onEnter: function(args) {
+                        sendLog("NATIVE_TLS_HOOK", "DEBUG", {function: func.name});
+                    }
+                });
+            });
+        } catch (e) {
+            sendLog("NATIVE_TLS_HOOK_ERROR", "ERROR", {error: e.message});
+        }
+
+        // ████████ DYNAMIC PROXY CONFIGURATION
+        try {
+            const Proxy = Java.use('java.net.Proxy');
+            const InetSocketAddress = Java.use('java.net.InetSocketAddress');
+            
+            Java.choose('okhttp3.OkHttpClient', {
+                onMatch: function(instance) {
+                    instance.proxy().implementation = function() {
+                        return Proxy.$new(
+                            Proxy.Type.HTTP,
+                            InetSocketAddress.$new(
+                                GHOST_CONFIG.PROXY_HOST, 
+                                GHOST_CONFIG.PROXY_PORT
+                            )
+                        );
+                    };
+                }
+            });
+        } catch (e) {
+            sendLog("DYNAMIC_PROXY_ERROR", "ERROR", {error: e.message});
+        }
+
+        // ████████ WEBSOCKET SECURITY HOOKS - CORRECTION APPLIQUÉE
+        try {
+            const WebSocket = Java.use('okhttp3.WebSocket');
+            const WebSocketListener = Java.use('okhttp3.WebSocketListener');
+            const ByteString = Java.use('okio.ByteString');
+            
+            // Hook pour les messages String
+            hookManager.registerHook('okhttp3.WebSocketListener', 'onMessage', function(webSocket, text) {
+                sendLog("WEBSOCKET_MESSAGE_STRING", "DEBUG", {
+                    length: text.length(),
+                    content: text.substring(0, 100)
+                });
+                
+                // Capture tokens dans les messages websocket
+                GHOST_CONFIG.TOKEN_PATTERNS.forEach(rx => {
+                    if (rx.test(text)) {
+                        ghostProcessor('WebSocket', 'message', text);
+                    }
+                });
+                
+                return this.onMessage(webSocket, text);
+            });
+
+            // Hook pour les messages ByteString
+            hookManager.registerHook('okhttp3.WebSocketListener', 'onMessage', function(webSocket, bytes) {
+                const text = bytes.utf8();
+                sendLog("WEBSOCKET_MESSAGE_BYTES", "DEBUG", {
+                    length: text.length(),
+                    content: text.substring(0, 100)
+                });
+                
+                GHOST_CONFIG.TOKEN_PATTERNS.forEach(rx => {
+                    if (rx.test(text)) {
+                        ghostProcessor('WebSocket', 'message', text);
+                    }
+                });
+                
+                return this.onMessage(webSocket, bytes);
+            });
+        } catch (e) {
+            sendLog("WEBSOCKET_ERROR", "DEBUG", {error: e.message});
+        }
+
+        // ████████ CA INJECTION SYSTEM
+        try {
+            const KeyStore = Java.use('java.security.KeyStore');
+            const TrustManagerFactory = Java.use('javax.net.ssl.TrustManagerFactory');
+            
+            // Custom CA loading
+            const customCA = [
+                "-----BEGIN CERTIFICATE-----\n...",  // Votre certificat CA personnalisé
+                "-----END CERTIFICATE-----"
+            ].join('\n');
+            
+            hookManager.registerHook('javax.net.ssl.TrustManagerFactory', 'init', function(ks) {
+                // Inject custom CA
+                const customKeyStore = KeyStore.getInstance(KeyStore.getDefaultType());
+                customKeyStore.load(null);
+                
+                customCA.split('-----END CERTIFICATE-----')
+                    .filter(cert => cert.trim().length > 0)
+                    .map(cert => cert + '-----END CERTIFICATE-----')
+                    .forEach((cert, i) => {
+                        const certFactory = Java.use('java.security.cert.CertificateFactory')
+                            .getInstance("X.509");
+                        const certStream = Java.use('java.io.ByteArrayInputStream')
+                            .$new(Java.array('byte', cert.getBytes()));
+                        const x509Cert = certFactory.generateCertificate(certStream);
+                        customKeyStore.setCertificateEntry("custom-ca-" + i, x509Cert);
+                    });
+                
+                return this.init(customKeyStore);
+            });
+        } catch (e) {
+            sendLog("CA_INJECTION_ERROR", "ERROR", {error: e.message});
+        }
+
+        // ████████ WEBVIEW SSL ERROR HANDLER (DEBUG MODE ONLY)
+        if (GHOST_CONFIG.DEBUG) {
+            try {
+                const WebViewClient = Java.use('android.webkit.WebViewClient');
+                hookManager.registerHook('android.webkit.WebViewClient', 'onReceivedSslError', function(view, handler, error) {
+                    sendLog("WEBVIEW_SSL_ERROR", "DEBUG", {
+                        error: error.toString(),
+                        url: view.getUrl()
+                    });
+                    handler.proceed();
+                });
+                
+                // Bypass pour WebView moderne (Chromium)
+                const AwContentsClient = Java.use('org.chromium.android_webview.AwContentsClient');
+                hookManager.registerHook('org.chromium.android_webview.AwContentsClient', 'onReceivedSslError', function(error) {
+                    sendLog("CHROMIUM_SSL_ERROR", "DEBUG", {error: error.toString()});
+                    return true; // Bypass
+                });
+                
+            } catch (e) {
+                sendLog("WEBVIEW_SSL_HOOK_ERROR", "DEBUG", {error: e.message});
+            }
+        }
+
+        // ████████ OKHTTP INTERCEPTION 2.0 - OPTIMISÉ POUR VINTED
+        try {
+            const RealCall = Java.use('okhttp3.RealCall');
+            
+            hookManager.registerHook('okhttp3.RealCall', 'execute', function() {
+                let request = this.request();
+                const url = request.url().toString();
+
+                // Log la requête avant modification
+                sendLog("REQUEST_INTERCEPT", "DEBUG", {
+                    url: url,
+                    method: request.method(),
+                    headers: request.headers().toString()
+                });
+
+                // Enhanced endpoint targeting
+                if (GHOST_CONFIG.CRITICAL_ENDPOINTS.some(ep => url.includes(ep))) {
+                    extractFromRequest(request, 'CriticalEndpoint');
+                    
+                    // Advanced POST body analysis
+                    if (request.method() === 'POST') {
+                        try {
+                            const body = Java.cast(request.body(), Java.use('okhttp3.FormBody'));
+                            for (let i = 0; i < body.size(); i++) {
+                                const value = body.encodedValue(i);
+                                GHOST_CONFIG.TOKEN_PATTERNS.forEach(rx => {
+                                    if (rx.test(value)) ghostProcessor('POST Body', body.encodedName(i), value);
+                                });
+                            }
+                        } catch (e) { 
+                            sendLog("POST_BODY_ERROR", "DEBUG", {error: e.message});
+                        }
+                    }
+                }
+                
+                const response = this.execute();
+                const headers = response.headers().toMultimap();
+                
+                // Enhanced Datadome detection
+                const isDatadome = headers.keySet().contains('x-datadome') || 
+                                   headers.keySet().contains('ddg2') ||
+                                   response.code() === 403 && headers.get("Server")?.contains('ddos');
+                
+                if (isDatadome) {
+                    extractFromResponse(response, 'Datadome');
+                }
+                
+                return response;
+            });
+        } catch (e) {
+            sendLog("OKHTTP_INTERCEPTION_ERROR", "ERROR", {error: e.message});
+        }
+
+        // ████████ KEYSTORE INTELLIGENCE
+        try {
+            const KeyStore = Java.use('java.security.KeyStore');
+            hookManager.registerHook('java.security.KeyStore', 'getKey', function(alias, password) {
+                if (GHOST_CONFIG.KEYSTORE_ALIASES.some(a => alias.includes(a))) {
+                    const key = this.getKey(alias, password);
+                    ghostProcessor('KeyStore', alias, bytesToHex(key.getEncoded()));
+                }
+                return this.getKey(alias, password);
+            });
+        } catch (e) {
+            sendLog("KEYSTORE_HOOK_ERROR", "ERROR", {error: e.message});
+        }
+        
+        // ████████ EXOPLAYER SSL BYPASS (Media playback)
+        try {
+            const CronetEngineBuilder = Java.use('org.chromium.net.CronetEngine$Builder');
+            hookManager.registerHook('org.chromium.net.CronetEngine$Builder', 'setEnablePublicKeyPinningBypassForLocalTrustAnchors', function(enable) {
+                // Force bypass
+                return this.setEnablePublicKeyPinningBypassForLocalTrustAnchors(true);
+            });
+        } catch (e) {
+            sendLog("EXOPLAYER_BYPASS_ERROR", "DEBUG", {error: e.message});
+        }
+
+        // ████████ SYSTEM LOAD LIBRARY BYPASS (NEW) =====
+        try {
+            const System = Java.use('java.lang.System');
+            hookManager.registerHook('java.lang.System', 'loadLibrary', function(libName) {
+                sendLog("LIB_LOAD_BYPASS", "DEBUG", {lib: libName});
+                return this.loadLibrary(libName);
+            });
+        } catch (e) {
+            sendLog("SYSTEM_LOAD_LIBRARY_HOOK_ERROR", "ERROR", {error: e.message});
+        }
+
+        // ████████ NATIVE SSL_CTX NEW BYPASS (NEW) =====
+        try {
+            const NativeCrypto = Java.use('com.android.org.conscrypt.NativeCrypto');
+            hookManager.registerHook('com.android.org.conscrypt.NativeCrypto', 'SSL_CTX_new', function() {
+                sendLog("SSL_CTX_NEW_BYPASS", "DEBUG", {});
+                return this.SSL_CTX_new();
+            });
+        } catch (e) {
+            sendLog("NATIVE_SSL_CTX_NEW_HOOK_ERROR", "ERROR", {error: e.message});
+        }
+    });
+
+    // ===== DATADOME COUNTERMEASURES =====
+    Java.perform(function() {
+        // ████████ JAVASCRIPT INTERCEPTION
+        try {
+            const WebViewEval = Java.use('android.webkit.WebView');
+            
+            hookManager.registerHook('android.webkit.WebView', 'evaluateJavascript', function(script, callback) {
+                if (GHOST_CONFIG.DEBUG) {
+                    sendLog("WEBVIEW_JS", "DEBUG", {script: script.slice(0, 100) + (script.length > 100 ? '...' : '')});
+                }
+                
+                if (script.includes('datadome')) {
+                    const overrideScript = `window.Datadome = window.Datadome || {}; 
+                        window.Datadome.onChallengeSuccess = function(token) { 
+                            Android.captureDatadomeToken(token); 
+                        };`;
+                    this.evaluateJavascript(overrideScript, null);
+                }
+                return this.evaluateJavascript(script, callback);
+            });
+        } catch (e) {
+            sendLog("WEBVIEW_JS_HOOK_ERROR", "ERROR", {error: e.message});
+        }
+
+        // ████████ ANDROID INTERFACE HOOK
+        try {
+            const WebViewInterface = Java.use('android.webkit.WebView');
+            
+            hookManager.registerHook('android.webkit.WebView', 'addJavascriptInterface', function(obj, name) {
+                if (name === 'Android') {
+                    const proxy = Java.registerClass({
+                        name: 'com.ghost.AndroidInterfaceProxy',
+                        implements: [obj.getClass()],
+                        methods: {
+                            captureDatadomeToken: function(token) {
+                                ghostProcessor('DatadomeJS', 'challenge_token', token);
+                            }
+                        }
+                    }).$new();
+                    return this.addJavascriptInterface(proxy, name);
+                }
+                return this.addJavascriptInterface(obj, name);
+            });
+        } catch (e) {
+            sendLog("ANDROID_INTERFACE_HOOK_ERROR", "ERROR", {error: e.message});
+        }
+    });
+
+    // ===== WEBVIEW WARFARE SUITE =====
+    Java.perform(function() {
+        try {
+            const WVClient = Java.use('android.webkit.WebViewClient');
+            
+            hookManager.registerHook('android.webkit.WebViewClient', 'onPageFinished', function(view, url) {
+                if (GHOST_CONFIG.DATADOME_TRIGGERS.some(t => url.includes(t))) {
+                    Java.choose('android.webkit.WebView', {
+                        onMatch: function(instance) {
+                            instance.evaluateJavascript(
+                                "(function() { return document.cookie; })()",
+                                Java.registerClass({
+                                    name: 'com.ghost.CookieCallback',
+                                    implements: [Java.use('android.webkit.ValueCallback')],
+                                    methods: {
+                                        onReceiveValue: function(cookie) {
+                                            ghostProcessor('WebView', 'Cookies', cookie);
+                                        }
+                                    }
+                                }).$new()
+                            );
+                        }
+                    });
+                }
+                return this.onPageFinished(view, url);
+            });
+        } catch (e) {
+            sendLog("WEBVIEW_WARFARE_ERROR", "ERROR", {error: e.message});
+        }
+    });
+
+    // ===== COOKIE MANAGER HOOK =====
+    Java.perform(() => {
+        try {
+            const CookieManager = Java.use('android.webkit.CookieManager');
+            
+            hookManager.registerHook('android.webkit.CookieManager', 'getCookie', function(url) {
+                const cookies = this.getCookie(url);
+                if (cookies) {
+                    ghostProcessor('CookieManager', url, cookies);
+                }
+                return cookies;
+            });
+
+            // NOUVELLE IMPLÉMENTATION CRITIQUE - SETCOOKIE HOOK
+            hookManager.registerHook('android.webkit.CookieManager', 'setCookie', function(url, cookie) {
+                ghostProcessor('CookieManager', 'SET_' + url, cookie);
+                return this.setCookie(url, cookie);
+            });
+        } catch (e) {
+            sendLog("COOKIE_MANAGER_HOOK_ERROR", "ERROR", {error: e.message});
+        }
+    });
+
+    // ===== HTTPURLCONNECTION HOOK =====
+    Java.perform(() => {
+        try {
+            const HUC = Java.use('java.net.HttpURLConnection');
+            
+            hookManager.registerHook('java.net.HttpURLConnection', 'getRequestProperties', function() {
+                const props = this.getRequestProperties();
+                if (props) {
+                    props.forEach((values, key) => {
+                        if (/cookie|authorization|token|datadome/i.test(key)) {
+                            values.forEach(value => {
+                                ghostProcessor('HttpURLConnection', key, value);
+                            });
+                        }
+                    });
+                }
+                return props;
+            });
+        } catch (e) {
+            sendLog("HTTPURLCONNECTION_HOOK_ERROR", "ERROR", {error: e.message});
+        }
+    });
+
+    // ===== SHARED PREFERENCES HOOK =====
+    Java.perform(() => {
+        try {
+            const SharedPreferences = Java.use('android.content.SharedPreferences');
+            
+            hookManager.registerHook('android.content.SharedPreferences', 'getString', function(key, defValue) {
+                const value = this.getString(key, defValue);
+                if (key && (key.includes("token") || key.includes("session") || key.includes("auth"))) {
+                    ghostProcessor('SharedPreferences', key, value);
+                }
+                return value;
+            });
+            
+            // CORRECTION : Hook du Editor pour les écritures
+            const SharedPreferencesEditor = Java.use('android.content.SharedPreferences$Editor');
+            
+            hookManager.registerHook('android.content.SharedPreferences$Editor', 'putString', function(key, value) {
+                if (key && (key.includes("token") || key.includes("session") || key.includes("auth"))) {
+                    ghostProcessor('SharedPreferences', 'SET_' + key, value);
+                }
+                return this.putString(key, value);
+            });
+        } catch (e) {
+            sendLog("SHARED_PREFERENCES_HOOK_ERROR", "ERROR", {error: e.message});
+        }
+    });
+
+    // ===== ENVIRONMENT VERIFICATION =====
+    Java.perform(function() {
+        function verifyEnvironment() {
+            try {
+                Java.use('okhttp3.OkHttpClient');
+                Java.use('android.webkit.WebView');
+                Java.use('java.net.HttpURLConnection');
+                Java.use('okhttp3.CertificatePinner');
+                Java.use('android.content.SharedPreferences');
+                Java.use('android.webkit.CookieManager');
+                return true;
+            } catch (e) {
+                sendLog("ENV_VERIFICATION", "ERROR", {error: e.message});
+                return false;
+            }
+        }
+        
+        if (!verifyEnvironment()) {
+            sendLog("ENV_VERIFICATION", "CRITICAL", {error: "MISSING_DEPENDENCIES"});
+        }
+    });
+
+    // Appliquer tous les hooks
+    hookManager.applyHooks();
+}
+
+// ===== ADVANCED UTILITIES =====
+function extractFromRequest(request, source) {
+    request.headers().toMultimap().forEach((values, name) => {
+        values.forEach(value => {
+            if (/authorization|datadome|cookie|x-token/i.test(name)) {
+                ghostProcessor(source, name, value);
+            }
+        });
+    });
+}
+
+// ===== ENHANCED TOKEN MANAGEMENT =====
+function extractFromResponse(response, source) {
+    try {
+        const body = response.body().string();
+        sendLog("RESPONSE_BODY", "DEBUG", {source, length: body.length});
+        
+        if (body && body.length < GHOST_CONFIG.MAX_BODY_SCAN) {
+            // Token pattern scanning
+            GHOST_CONFIG.TOKEN_PATTERNS.forEach(rx => {
+                try {
+                    const match = body.match(rx);
+                    if (match) ghostProcessor(source, 'Body', match[0]);
+                } catch (e) {
+                    sendLog("REGEX_ERROR", "DEBUG", {error: e.message});
+                }
+            });
+
+            // JSON-based token extraction
+            try {
+                const json = JSON.parse(body);
+                const tokenKeys = [
+                    'refreshToken', 'refresh_token', 'access_token', 
+                    'id_token', 'session_token'
+                ];
+                
+                tokenKeys.forEach(key => {
+                    if (json[key]) {
+                        ghostProcessor('JSON_RESPONSE', key, json[key]);
+                        
+                        // Auto-update vault for refresh tokens
+                        if (key.includes('refresh')) {
+                            sessionVault.authToken = json[key];
+                            sessionVault.lastUpdated = Date.now();
+                            saveVault();
+                        }
+                    }
+                });
+                
+                // Extract token expiration
+                if (json.expires_in) {
+                    const expiresIn = parseInt(json.expires_in) * 1000;
+                    const expirationTime = Date.now() + expiresIn;
+                    sendLog("TOKEN_EXPIRATION", "INFO", {
+                        expires_in: expiresIn,
+                        expiration_time: expirationTime
+                    });
+                    
+                    // Schedule token refresh 1 minute before expiration
+                    if (expiresIn > 60000) {
+                        setTimeout(
+                            () => refreshSessionTokens(), 
+                            expiresIn - 60000
+                        );
+                    }
+                }
+            } catch (e) {}
+        }
+    } catch (e) {
+        sendLog("RESPONSE_PROCESSING", "DEBUG", {error: e.message});
+    }
+}
+
+function bytesToHex(bytes) {
+    return Array.from(bytes, b => 
+        ('0' + (b & 0xFF).toString(16)).slice(-2)).join('');
+}
+
+function hashString(str) {
+    try {
+        return Java.use('java.security.MessageDigest')
+            .getInstance('SHA-256')
+            .digest(str.getBytes())
+            .map(b => (b & 0xFF).toString(16).padStart(2, '0'))
+            .join('')
+            .substring(0, 32);
+    } catch (e) {
+        // Fallback JS pur
+        const hash = Array.from(new Uint8Array(
+            crypto.subtle.digestSync('SHA-256', new TextEncoder().encode(str))
+        ));
+        return hash.map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 32);
+    }
+}
+
+function getCallContext() {
+    try {
+        return Java.use('android.util.Log').getStackTraceString(
+            Java.use('java.lang.Throwable').$new()
+        );
+    } catch (e) {
+        return "CONTEXT_UNAVAILABLE";
+    }
+}
+
+function getCompactStack() {
+    try {
+        const stack = Java.use('java.lang.Thread').currentThread().getStackTrace();
+        return stack.slice(0, 5).map(frame => frame.toString()).join(' <- ');
+    } catch (e) {
+        return "STACK_UNAVAILABLE";
+    }
+}
+
+function scheduleStealthFlush() {
+    if (stealthTimer) return;
+    stealthTimer = setTimeout(() => {
+        if (tokenMatrix.size > 0) {
+            sendLog("TOKEN_FLUSH", "INFO", {count: tokenMatrix.size});
+            tokenMatrix.clear();
+        }
+        stealthTimer = null;
+    }, GHOST_CONFIG.BATCH_INTERVAL);
+}
+
+// ===== CONTINGENCY PROTOCOL =====
+setInterval(() => {
+    if (tokenMatrix.size === 0) {
+        Java.perform(() => {
+            try {
+                const context = Java.use('android.app.ActivityThread')
+                    .currentApplication()
+                    .getApplicationContext();
+                
+                // Scan multiple preference files
+                const prefsNames = [
+                    "vinted_prefs", 
+                    "fr.vinted.preferences",
+                    "com.vinted.preferences",
+                    "session_store"
+                ];
+                
+                prefsNames.forEach(prefName => {
+                    try {
+                        const prefs = context.getSharedPreferences(prefName, 0);
+                        const tokens = prefs.getAll();
+                        
+                        Object.keys(tokens).forEach(key => {
+                            if (key.includes("token") || 
+                                key.includes("session") || 
+                                key.includes("auth")) {
+                                ghostProcessor('StorageFallback', key, tokens[key].toString());
+                            }
+                        });
+                    } catch (e) {}
+                });
+            } catch (e) { 
+                sendLog("CONTINGENCY_ERROR", "ERROR", {error: e.message});
+            }
+        });
+    }
+}, 30000);
+
+// ===== AUTOMATED TOKEN REFRESH =====
+function refreshSessionTokens() {
+    sendLog("SESSION_REFRESH_START", "INFO", {});
+    
+    Java.perform(() => {
+        try {
+            // Trigger API call to refresh session
+            const URL = Java.use('java.net.URL');
+            const HttpURLConnection = Java.use('java.net.HttpURLConnection');
+            
+            const refreshUrl = new URL("https://www.vinted.fr/api/v2/auth/token/refresh");
+            const connection = refreshUrl.openConnection();
+            
+            connection.setRequestMethod("POST");
+            connection.setDoOutput(true);
+            
+            if (sessionVault.vintedSession) {
+                connection.setRequestProperty("Cookie", "vinted_fr_session=" + sessionVault.vintedSession);
+            }
+            
+            const outputStream = connection.getOutputStream();
+            outputStream.write(Java.array('byte', "{}".getBytes()));
+            outputStream.flush();
+            
+            const responseCode = connection.getResponseCode();
+            sendLog("SESSION_REFRESH_RESPONSE", "INFO", {code: responseCode});
+        } catch (e) {
+            sendLog("SESSION_REFRESH_ERROR", "ERROR", {error: e.message});
+        }
+    });
+    
+    sendLog("SESSION_REFRESH_COMPLETE", "INFO", {});
+}
+
+// ==== CHILD PROCESS HANDLING - ENHANCED ====
+const childProcesses = new Map();
+
+function monitorChildProcesses() {
+    try {
+        const currentProcesses = new Set(
+            Process.enumerateProcesses().map(p => p.pid)
+        );
+        
+        // Vérifier les processus manquants
+        childProcesses.forEach((session, pid) => {
+            if (!currentProcesses.has(pid)) {
+                sendLog("CHILD_PROCESS_TERMINATED", "DEBUG", {pid});
+                childProcesses.delete(pid);
+            }
+        });
+        
+        // Détecter les nouveaux processus
+        Process.enumerateProcesses().forEach(proc => {
+            const pid = proc.pid;
+            
+            if (pid !== Process.id && 
+                !childProcesses.has(pid) &&
+                proc.name.includes("vinted")) {
+                
+                sendLog("CHILD_PROCESS_DETECTED", "WARNING", {
+                    pid: pid,
+                    name: proc.name,
+                    parent: Process.id
+                });
+                
+                try {
+                    const session = attach(pid);
+                    session.detached.connect(reason => {
+                        sendLog("CHILD_DETACHED", "DEBUG", {
+                            pid: pid, 
+                            reason: reason
+                        });
+                        childProcesses.delete(pid);
+                    });
+                    
+                    session.enableJit();
+                    const script = session.createScript(loadGhostScript());
+                    script.message.connect(message => {
+                        try {
+                            const parsed = JSON.parse(message);
+                            send(JSON.stringify({
+                                ...parsed,
+                                originPid: pid
+                            }));
+                        } catch(e) {
+                            send(message);
+                        }
+                    });
+                    
+                    script.load();
+                    childProcesses.set(pid, session);
+                    
+                    sendLog("CHILD_INJECTED", "SUCCESS", {
+                        pid: pid,
+                        time: Date.now()
+                    });
+                    
+                } catch (e) {
+                    sendLog("CHILD_INJECTION_FAILED", "ERROR", {
+                        pid: pid,
+                        error: e.message,
+                        stack: e.stack
+                    });
+                }
+            }
+        });
+    } catch (e) {
+        sendLog("CHILD_MONITOR_ERROR", "ERROR", {
+            error: e.message,
+            stack: e.stack
+        });
+    }
+}
+
+// Charger le script pour les processus enfants
+function loadGhostScript() {
+    // Cette fonction retourne le contenu actuel du script
+    // Note: Dans une implémentation réelle, vous devrez lire le fichier JS
+    return `
+        (function() {
+            // Copie minimale du script pour les processus enfants
+            const GHOST_CONFIG = ${JSON.stringify(GHOST_CONFIG)};
+            
+            function sendLog(event, type, data) {
+                send(JSON.stringify({
+                    event,
+                    type,
+                    timestamp: Date.now(),
+                    pid: Process.id,
+                    data
+                }));
+            }
+            
+            sendLog("CHILD_SCRIPT_LOADED", "INFO", {
+                parent: ${Process.id},
+                config: GHOST_CONFIG
+            });
+            
+            // Initialisation JVM dans les enfants
+            setTimeout(() => {
+                if (typeof Java !== 'undefined' && Java.available) {
+                    Java.perform(() => {
+                        sendLog("CHILD_JAVA_ACTIVATED", "SUCCESS", {pid: Process.id});
+                    });
+                }
+            }, 5000);
+        })();
+    `;
+}
+
+// ==== ENTRY POINT OPTIMIZED ====
+setTimeout(() => {
+    sendLog("GHOST_PROTOCOL_ACTIVATED", "INFO", {
+        version: "13.1",
+        pid: Process.id,
+        features: [
+            "Enhanced_JVM_Monitoring",
+            "Multi_Process_Injection",
+            "Exponential_JVM_Detection",
+            "Child_Process_Monitoring_v2"
+        ]
+    });
+    
+    // Démarrer le monitoring JVM
+    monitorJvm();
+    
+    // Démarrer la surveillance des processus enfants
+    setInterval(
+        monitorChildProcesses, 
+        GHOST_CONFIG.CHILD_PROCESS_CHECK_INTERVAL
+    );
+    
+    // Forcer une vérification immédiate
+    setTimeout(monitorChildProcesses, 1000);
+    
+}, 1500);  // Démarrer après 1.5s
+
+// ==== NATIVE JVM LOADER ====
+Interceptor.attach(Module.findExportByName(null, "JNI_CreateJavaVM"), {
+    onEnter: function(args) {
+        sendLog("NATIVE_JVM_CREATE", "DEBUG", {
+            pid: Process.id,
+            time: Date.now()
+        });
+    },
+    onLeave: function(retval) {
+        if (retval.toInt32() === 0) {
+            sendLog("NATIVE_JVM_SUCCESS", "INFO", {
+                pid: Process.id,
+                time: Date.now()
+            });
+        } else {
+            sendLog("NATIVE_JVM_FAILURE", "ERROR", {
+                code: retval,
+                pid: Process.id
+            });
+        }
+    }
+});
+
+// ==== ANDROID JVM BRIDGE DETECTION ====
+if (Java.available) {
+    Java.perform(() => {
+        try {
+            const System = Java.use('java.lang.System');
+            sendLog("JVM_BRIDGE_ACTIVE", "SUCCESS", {
+                jvmVersion: System.getProperty("java.vm.version"),
+                pid: Process.id
+            });
+        } catch (e) {
+            sendLog("JVM_BRIDGE_ERROR", "ERROR", {
+                error: e.message,
+                pid: Process.id
+            });
+        }
+    });
+}
