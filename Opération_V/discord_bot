@@ -1,0 +1,993 @@
+#!/usr/bin/env python3
+
+import discord
+import asyncio
+from discord.ext import commands, tasks
+from discord import ui, ButtonStyle, SelectOption
+from dotenv import load_dotenv
+import os
+import logging
+from datetime import datetime
+from typing import List, Dict, Optional
+from platov_deepseek import optimize_catalog, generer_description_depuis_texte
+# Chargement du .env et configuration logging
+load_dotenv()
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger('VintedBotPro')
+
+# Configuration des paramètres Discord
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+DISCORD_CHANNEL_SCRAPER = int(os.getenv("DISCORD_CHANNEL_SCRAPER"))
+DISCORD_CHANNEL_DESCRIPTIONS = int(os.getenv("DISCORD_CHANNEL_DESCRIPTIONS"))
+DISCORD_CHANNEL_ADMIN = int(os.getenv("DISCORD_CHANNEL_ADMIN"))
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+VINTED_BASE_URL = os.getenv("VINTED_BASE_URL", "https://www.vinted.fr")
+
+# Intents Discord
+intents = discord.Intents.default()
+intents.message_content = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# État global pour le mode DeepSeek
+deepseek_active = False
+
+# Import du scraper optimisé
+# Correction des imports
+from VintedScanner_main.vinted_scanner import (
+    load_catalog,
+    update_catalog as update_vinted_catalog,
+    get_catalog_age,
+    find_similar_items,
+    VintedSearch
+)
+
+# ================ #
+#  FONCTIONS UTILITAIRES MANQUANTES  #
+# ================ #
+
+def is_catalog_fresh(max_age=3600):
+    """Vérifie si le catalogue est récent (moins de max_age secondes)."""
+    try:
+        return get_catalog_age() <= max_age
+    except Exception as e:
+        logger.error(f"Erreur vérification fraîcheur catalogue : {str(e)}")
+        return False
+
+# ================ #
+#  DISCORD UI      #
+# ================ #
+
+class SearchMenuView(ui.View):
+    """Menu principal de recherche Vinted avec tous les filtres"""
+
+    def __init__(self, user_id: int):
+        super().__init__(timeout=180)
+        self.user_id = user_id
+        self.config = user_search_configs.get(user_id, {})
+
+    # ... reste du code inchangé ...
+
+
+# Dans la classe SearchMenuView (méthode start_search)
+async def start_search(self, interaction: discord.Interaction, button: ui.Button):
+    if not self.config.get("category_id"):
+        await interaction.response.send_message("⚠️ Configurez d'abord une catégorie", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    # Conversion des paramètres
+    search_params = {
+        "category_ids": [int(self.config["category_id"])],
+        "brand_ids": [int(self.config["brand_id"])] if "brand_id" in self.config else None,
+        "size_ids": [int(self.config["size_id"])] if "size_id" in self.config else None,
+        "color_ids": [int(self.config["color_id"])] if "color_id" in self.config else None,
+        "material_ids": [int(self.config["material_id"])] if "material_id" in self.config else None,
+        "status_ids": [int(self.config["condition_id"])] if "condition_id" in self.config else None,
+        "max_items": 100
+    }
+
+    # Recherche avec gestion d'erreur
+    try:
+        results = VintedSearch.search_items(**search_params)
+    except Exception as e:
+        logger.error(f"Erreur recherche: {str(e)}", exc_info=True)
+        await interaction.followup.send("❌ Erreur lors de la recherche", ephemeral=True)
+        return
+
+    # ... reste du code inchangé ...
+
+
+# Dans la commande search_now
+async def search_now(ctx):
+    """Lance une recherche immédiate"""
+    channel = bot.get_channel(DISCORD_CHANNEL_SCRAPER)
+    filters = user_search_configs.get(ctx.author.id, {})
+
+    # Conversion des paramètres
+    search_params = {
+        "category_ids": [int(filters["category_id"])] if "category_id" in filters else None,
+        "brand_ids": [int(filters["brand_id"])] if "brand_id" in filters else None,
+        "size_ids": [int(filters["size_id"])] if "size_id" in filters else None,
+        "color_ids": [int(filters["color_id"])] if "color_id" in filters else None,
+        "material_ids": [int(filters["material_id"])] if "material_id" in filters else None,
+        "status_ids": [int(filters["condition_id"])] if "condition_id" in filters else None,
+        "max_items": 5
+    }
+
+    try:
+        results = VintedSearch.search_items(**search_params)
+    except Exception as e:
+        logger.error(f"Erreur recherche immédiate: {str(e)}", exc_info=True)
+        await channel.send("❌ Erreur lors de la recherche")
+        return
+
+
+def get_category_options(category_id: Optional[int] = None) -> Dict:
+    """Récupère les options disponibles pour une catégorie"""
+    catalog = load_catalog()
+    if category_id:
+        # Dans une version future, on pourrait filtrer les options par catégorie
+        pass
+    return {
+        "brands": catalog.get("brands", []),
+        "sizes": catalog.get("sizes", []),
+        "colors": catalog.get("colors", []),
+        "genders": catalog.get("genders", []),
+        "materials": catalog.get("materials", []),
+        "seasons": catalog.get("seasons", []),
+        "conditions": catalog.get("conditions", [])
+    }
+
+
+def create_item_embed(item: Dict) -> discord.Embed:
+    """Crée un embed Discord pour un produit avec tous les filtres"""
+    embed = discord.Embed(
+        title=item.get("title", "Sans titre"),
+        url=item.get("url", ""),
+        description=f"**Prix:** {item.get('price', 'N/A')}",
+        color=0x00b0f4,
+        timestamp=datetime.utcnow()
+    )
+
+    # Champs principaux
+    if item.get("brand"):
+        embed.add_field(name="Marque", value=item["brand"], inline=True)
+    if item.get("size"):
+        embed.add_field(name="Taille", value=item["size"], inline=True)
+    if item.get("condition"):
+        embed.add_field(name="État", value=item["condition"], inline=True)
+
+    # Nouveaux champs
+    if item.get("color"):
+        embed.add_field(name="Couleur", value=item["color"], inline=True)
+    if item.get("gender"):
+        embed.add_field(name="Genre", value=item["gender"], inline=True)
+    if item.get("material"):
+        embed.add_field(name="Matériau", value=item["material"], inline=True)
+    if item.get("season"):
+        embed.add_field(name="Saison", value=item["season"], inline=True)
+
+    if item.get("image"):
+        embed.set_thumbnail(url=item["image"])
+
+    return embed
+
+from VintedScanner_main.vinted_scanner import get_catalog_age
+from VintedScanner_main.config import config
+
+logger = logging.getLogger('VintedBotPro')
+
+def is_catalog_fresh():
+    """
+    Vérifie si le cache du catalogue Vinted est encore valable.
+    Retourne True si le catalogue est toujours dans le délai de validité (TTL).
+    """
+    try:
+        age = get_catalog_age()
+
+        if not isinstance(age, (int, float)) or age < 0:
+            logger.warning(f"[Cache] Âge du catalogue incohérent : {age}")
+            return False
+
+        if age > config.CACHE_TTL:
+            logger.info(f"[Cache] Catalogue trop ancien ({age}s > {config.CACHE_TTL}s), mise à jour nécessaire.")
+            return False
+
+        logger.info(f"[Cache] Catalogue encore valide ({age}s < {config.CACHE_TTL}s).")
+        return True
+
+    except Exception as e:
+        logger.error(f"[Cache] Erreur lors de la vérification de l’âge du catalogue : {e}")
+        return False
+# ================ #
+#  DISCORD UI      #
+# ================ #
+
+class SearchMenuView(ui.View):
+    """Menu principal de recherche Vinted avec tous les filtres"""
+
+    def __init__(self, user_id: int):
+        super().__init__(timeout=180)
+        self.user_id = user_id
+        self.config = user_search_configs.get(user_id, {})
+
+    @ui.button(label="Sélectionner Catégorie", style=ButtonStyle.primary, row=0)
+    async def select_category(self, interaction: discord.Interaction, button: ui.Button):
+        if not await ensure_fresh_catalog(interaction):
+            return
+
+        catalog = load_catalog()
+        current_config = user_search_configs.get(self.user_id, {})
+
+        # Déterminer le point de départ pour la sélection de catégorie
+        if "category_id" in current_config:
+            # Continuer à partir du niveau actuel
+            categories = get_subcategories(catalog.get("categories", []), int(current_config["category_id"]))
+            message = "Choisissez une sous-catégorie:"
+        else:
+            # Commencer à partir des catégories racines
+            categories = catalog.get("categories", [])
+            message = "Choisissez une catégorie principale:"
+
+        if not categories:
+            await interaction.response.send_message("❌ Aucune catégorie disponible", ephemeral=True)
+            return
+
+        view = CategorySelectView(self.user_id, categories)
+        await interaction.response.send_message(
+            message,
+            view=view,
+            ephemeral=True
+        )
+
+    @ui.button(label="Filtrer par Marque", style=ButtonStyle.secondary, row=0)
+    async def filter_brand(self, interaction: discord.Interaction, button: ui.Button):
+        if not self.config.get("category_id"):
+            await interaction.response.send_message("⚠️ Sélectionnez d'abord une catégorie", ephemeral=True)
+            return
+
+        filters = get_category_options(self.config["category_id"])
+        brands = filters.get("brands", [])
+
+        if not brands:
+            await interaction.response.send_message("❌ Aucune marque disponible", ephemeral=True)
+            return
+
+        view = BrandSelectView(self.user_id, brands)
+        await interaction.response.send_message(
+            "Choisissez une marque:",
+            view=view,
+            ephemeral=True
+        )
+
+    @ui.button(label="Filtrer par Taille", style=ButtonStyle.secondary, row=0)
+    async def filter_size(self, interaction: discord.Interaction, button: ui.Button):
+        if not self.config.get("category_id"):
+            await interaction.response.send_message("⚠️ Sélectionnez d'abord une catégorie", ephemeral=True)
+            return
+
+        filters = get_category_options(self.config["category_id"])
+        sizes = filters.get("sizes", [])
+
+        if not sizes:
+            await interaction.response.send_message("❌ Aucune taille disponible", ephemeral=True)
+            return
+
+        view = SizeSelectView(self.user_id, sizes)
+        await interaction.response.send_message(
+            "Choisissez une taille:",
+            view=view,
+            ephemeral=True
+        )
+
+    @ui.button(label="Filtrer par Couleur", style=ButtonStyle.secondary, row=1)
+    async def filter_color(self, interaction: discord.Interaction, button: ui.Button):
+        if not self.config.get("category_id"):
+            await interaction.response.send_message("⚠️ Sélectionnez d'abord une catégorie", ephemeral=True)
+            return
+
+        filters = get_category_options(self.config["category_id"])
+        colors = filters.get("colors", [])
+
+        if not colors:
+            await interaction.response.send_message("❌ Aucune couleur disponible", ephemeral=True)
+            return
+
+        view = ColorSelectView(self.user_id, colors)
+        await interaction.response.send_message(
+            "Choisissez une couleur:",
+            view=view,
+            ephemeral=True
+        )
+
+    async def ensure_fresh_catalog(ctx_or_interaction=None, silent=False):
+        """
+        Vérifie et met à jour le catalogue si besoin.
+        - ctx_or_interaction : ctx Discord, interaction Discord ou None (appel interne).
+        - silent : si True, ne pas envoyer de message utilisateur (logs uniquement).
+        """
+        from VintedScanner_main.vinted_scanner import get_catalog_age, async_update_catalog
+        from config import config
+
+        try:
+            age = get_catalog_age()
+            if age <= config.CACHE_TTL:
+                logger.info(f"[Cache] ✅ Catalogue valide ({age}s < {config.CACHE_TTL}s)")
+                if not silent:
+                    await send_feedback(ctx_or_interaction, f"✅ Catalogue à jour ({format_age(age)}).")
+                return True
+
+            logger.info(f"[Cache] 🟡 Catalogue expiré ({age}s > {config.CACHE_TTL}s), mise à jour automatique...")
+            if not silent:
+                await send_feedback(ctx_or_interaction,
+                                    f"🔄 Catalogue expiré ({format_age(age)}), mise à jour en cours...")
+
+            success = await async_update_catalog()
+
+            if success:
+                logger.info("[Cache] ✅ Catalogue mis à jour avec succès.")
+                if not silent:
+                    await send_feedback(ctx_or_interaction, "✅ Catalogue mis à jour avec succès.")
+                return True
+            else:
+                logger.error("[Cache] ❌ Échec de la mise à jour automatique.")
+                if not silent:
+                    await send_feedback(ctx_or_interaction, "❌ Échec lors de la mise à jour du catalogue.")
+                return False
+
+        except Exception as e:
+            logger.error(f"🔥 Erreur ensure_fresh_catalog : {e}", exc_info=True)
+            if not silent:
+                await send_feedback(ctx_or_interaction, f"❌ Erreur interne : {type(e).__name__} → {e}")
+            return False
+
+    async def send_feedback(ctx_or_interaction, content: str):
+        """
+        Envoie un message d'état dans le bon contexte :
+        - ctx.send()
+        - interaction.response.send_message()
+        - interaction.followup.send()
+        - log fallback
+        """
+        try:
+            if ctx_or_interaction is None:
+                logger.info(f"[Feedback] {content}")
+                return
+
+            if hasattr(ctx_or_interaction, "response") and not ctx_or_interaction.response.is_done():
+                await ctx_or_interaction.response.send_message(content, ephemeral=True)
+            elif hasattr(ctx_or_interaction, "followup"):
+                await ctx_or_interaction.followup.send(content, ephemeral=True)
+            elif hasattr(ctx_or_interaction, "send"):
+                await ctx_or_interaction.send(content)
+            else:
+                logger.warning(f"⚠️ Contexte Discord inconnu pour send_feedback() : {content}")
+
+        except Exception as e:
+            logger.error(f"⚠️ Échec envoi feedback Discord : {e}")
+
+    def format_age(seconds):
+        """Affiche proprement une durée en heures/minutes/secondes"""
+        from datetime import timedelta
+        return str(timedelta(seconds=int(seconds)))
+
+    @ui.button(label="Filtrer par Genre", style=ButtonStyle.secondary, row=1)
+    async def filter_gender(self, interaction: discord.Interaction, button: ui.Button):
+        if not self.config.get("category_id"):
+            await interaction.response.send_message("⚠️ Sélectionnez d'abord une catégorie", ephemeral=True)
+            return
+
+        filters = get_category_options(self.config["category_id"])
+        genders = filters.get("genders", [])
+
+        if not genders:
+            await interaction.response.send_message("❌ Aucun genre disponible", ephemeral=True)
+            return
+
+        view = GenderSelectView(self.user_id, genders)
+        await interaction.response.send_message(
+            "Choisissez un genre:",
+            view=view,
+            ephemeral=True
+        )
+
+    @ui.button(label="Filtrer par Matériau", style=ButtonStyle.secondary, row=2)
+    async def filter_material(self, interaction: discord.Interaction, button: ui.Button):
+        if not self.config.get("category_id"):
+            await interaction.response.send_message("⚠️ Sélectionnez d'abord une catégorie", ephemeral=True)
+            return
+
+        filters = get_category_options(self.config["category_id"])
+        materials = filters.get("materials", [])
+
+        if not materials:
+            await interaction.response.send_message("❌ Aucun matériau disponible", ephemeral=True)
+            return
+
+        view = MaterialSelectView(self.user_id, materials)
+        await interaction.response.send_message(
+            "Choisissez un matériau:",
+            view=view,
+            ephemeral=True
+        )
+
+    @ui.button(label="Filtrer par Saison", style=ButtonStyle.secondary, row=2)
+    async def filter_season(self, interaction: discord.Interaction, button: ui.Button):
+        if not self.config.get("category_id"):
+            await interaction.response.send_message("⚠️ Sélectionnez d'abord une catégorie", ephemeral=True)
+            return
+
+        filters = get_category_options(self.config["category_id"])
+        seasons = filters.get("seasons", [])
+
+        if not seasons:
+            await interaction.response.send_message("❌ Aucune saison disponible", ephemeral=True)
+            return
+
+        view = SeasonSelectView(self.user_id, seasons)
+        await interaction.response.send_message(
+            "Choisissez une saison:",
+            view=view,
+            ephemeral=True
+        )
+
+    @ui.button(label="Filtrer par État", style=ButtonStyle.secondary, row=3)
+    async def filter_condition(self, interaction: discord.Interaction, button: ui.Button):
+        if not self.config.get("category_id"):
+            await interaction.response.send_message("⚠️ Sélectionnez d'abord une catégorie", ephemeral=True)
+            return
+
+        filters = get_category_options(self.config["category_id"])
+        conditions = filters.get("conditions", [])
+
+        if not conditions:
+            await interaction.response.send_message("❌ Aucun état disponible", ephemeral=True)
+            return
+
+        view = ConditionSelectView(self.user_id, conditions)
+        await interaction.response.send_message(
+            "Choisissez un état:",
+            view=view,
+            ephemeral=True
+        )
+
+    @ui.button(label="🔍 Lancer la Recherche", style=ButtonStyle.success, row=4)
+    async def start_search(self, interaction: discord.Interaction, button: ui.Button):
+        if not self.config.get("category_id"):
+            await interaction.response.send_message("⚠️ Configurez d'abord une catégorie", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        results = await search_items(**self.config)
+
+        if not results:
+            await interaction.followup.send("❌ Aucun résultat trouvé", ephemeral=True)
+            return
+
+        # Envoyer dans le salon scraper
+        channel = bot.get_channel(DISCORD_CHANNEL_SCRAPER)
+        for item in results[:3]:
+            await channel.send(embed=create_item_embed(item))
+
+        await interaction.followup.send(f"✅ {len(results)} articles envoyés dans <#{DISCORD_CHANNEL_SCRAPER}>",
+                                        ephemeral=True)
+
+    @ui.button(label="🔄 Réinitialiser", style=ButtonStyle.danger, row=4)
+    async def reset_config(self, interaction: discord.Interaction, button: ui.Button):
+        self.config = {}
+        user_search_configs[self.user_id] = {}
+        await interaction.response.send_message("✅ Configuration réinitialisée", ephemeral=True)
+
+
+class CategorySelectView(ui.View):
+    """Vue de sélection de catégorie avec navigation récursive"""
+
+    def __init__(self, user_id: int, categories: List[Dict]):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.add_item(CategorySelect(categories))
+
+
+class CategorySelect(ui.Select):
+    def __init__(self, categories: List[Dict]):
+        options = [
+            SelectOption(
+                label=cat["name"][:100],
+                value=str(cat["id"]),
+                description=f"ID: {cat['id']}"[:100]
+            ) for cat in categories[:25]
+        ]
+        super().__init__(
+            placeholder="Sélectionnez une option...",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        user_id = interaction.user.id
+        selected_id = int(self.values[0])
+
+        # Charger le catalogue et trouver les sous-catégories
+        catalog = load_catalog()
+        subcategories = get_subcategories(catalog.get("categories", []), selected_id)
+
+        if subcategories:
+            # Mettre à jour la configuration avec la sélection actuelle
+            config = user_search_configs.get(user_id, {})
+            config["category_id"] = str(selected_id)
+            user_search_configs[user_id] = config
+
+            # Afficher le menu des sous-catégories
+            view = CategorySelectView(user_id, subcategories)
+            await interaction.response.edit_message(
+                content="Choisissez une sous-catégorie:",
+                view=view
+            )
+        else:
+            # Catégorie finale sélectionnée
+            config = user_search_configs.get(user_id, {})
+            config["category_id"] = str(selected_id)
+            user_search_configs[user_id] = config
+
+            await interaction.response.send_message(
+                f"✅ Catégorie finale sélectionnée: {self.get_option(self.values[0])}",
+                ephemeral=True
+            )
+
+    def get_option(self, value: str) -> str:
+        return next((opt.label for opt in self.options if opt.value == value), value)
+
+
+class BrandSelectView(ui.View):
+    """Vue de sélection de marque"""
+
+    def __init__(self, user_id: int, brands: List[Dict]):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.add_item(BrandSelect(brands))
+
+
+class BrandSelect(ui.Select):
+    def __init__(self, brands: List[Dict]):
+        options = [
+            SelectOption(
+                label=brand["name"][:100],
+                value=str(brand["id"]),
+                description=f"ID: {brand['id']}"[:100]
+            ) for brand in brands[:25]
+        ]
+        super().__init__(
+            placeholder="Choisissez une marque...",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        user_id = interaction.user.id
+        config = user_search_configs.get(user_id, {})
+        config["brand_id"] = self.values[0]
+        user_search_configs[user_id] = config
+
+        await interaction.response.send_message(
+            f"✅ Marque sélectionnée: {self.get_option(self.values[0])}",
+            ephemeral=True
+        )
+
+    def get_option(self, value: str) -> str:
+        return next((opt.label for opt in self.options if opt.value == value), value)
+
+
+class SizeSelectView(ui.View):
+    """Vue de sélection de taille"""
+
+    def __init__(self, user_id: int, sizes: List[Dict]):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.add_item(SizeSelect(sizes))
+
+
+class SizeSelect(ui.Select):
+    def __init__(self, sizes: List[Dict]):
+        options = [
+            SelectOption(
+                label=size["title"][:100],
+                value=str(size["id"]),
+                description=f"ID: {size['id']}"[:100]
+            ) for size in sizes[:25]
+        ]
+        super().__init__(
+            placeholder="Choisissez une taille...",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        user_id = interaction.user.id
+        config = user_search_configs.get(user_id, {})
+        config["size_id"] = self.values[0]
+        user_search_configs[user_id] = config
+
+        await interaction.response.send_message(
+            f"✅ Taille sélectionnée: {self.get_option(self.values[0])}",
+            ephemeral=True
+        )
+
+    def get_option(self, value: str) -> str:
+        return next((opt.label for opt in self.options if opt.value == value), value)
+
+
+class ColorSelectView(ui.View):
+    """Vue de sélection de couleur"""
+
+    def __init__(self, user_id: int, colors: List[Dict]):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.add_item(ColorSelect(colors))
+
+
+class ColorSelect(ui.Select):
+    def __init__(self, colors: List[Dict]):
+        options = [
+            SelectOption(
+                label=color["title"][:100],
+                value=str(color["id"]),
+                description=f"ID: {color['id']}"[:100]
+            ) for color in colors[:25]
+        ]
+        super().__init__(
+            placeholder="Choisissez une couleur...",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        user_id = interaction.user.id
+        config = user_search_configs.get(user_id, {})
+        config["color_id"] = self.values[0]
+        user_search_configs[user_id] = config
+
+        await interaction.response.send_message(
+            f"✅ Couleur sélectionnée: {self.get_option(self.values[0])}",
+            ephemeral=True
+        )
+
+    def get_option(self, value: str) -> str:
+        return next((opt.label for opt in self.options if opt.value == value), value)
+
+
+class GenderSelectView(ui.View):
+    """Vue de sélection de genre"""
+
+    def __init__(self, user_id: int, genders: List[Dict]):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.add_item(GenderSelect(genders))
+
+
+class GenderSelect(ui.Select):
+    def __init__(self, genders: List[Dict]):
+        options = [
+            SelectOption(
+                label=gender["title"][:100],
+                value=str(gender["id"]),
+                description=f"ID: {gender['id']}"[:100]
+            ) for gender in genders[:25]
+        ]
+        super().__init__(
+            placeholder="Choisissez un genre...",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        user_id = interaction.user.id
+        config = user_search_configs.get(user_id, {})
+        config["gender_id"] = self.values[0]
+        user_search_configs[user_id] = config
+
+        await interaction.response.send_message(
+            f"✅ Genre sélectionné: {self.get_option(self.values[0])}",
+            ephemeral=True
+        )
+
+    def get_option(self, value: str) -> str:
+        return next((opt.label for opt in self.options if opt.value == value), value)
+
+
+class MaterialSelectView(ui.View):
+    """Vue de sélection de matériau"""
+
+    def __init__(self, user_id: int, materials: List[Dict]):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.add_item(MaterialSelect(materials))
+
+
+class MaterialSelect(ui.Select):
+    def __init__(self, materials: List[Dict]):
+        options = [
+            SelectOption(
+                label=material["title"][:100],
+                value=str(material["id"]),
+                description=f"ID: {material['id']}"[:100]
+            ) for material in materials[:25]
+        ]
+        super().__init__(
+            placeholder="Choisissez un matériau...",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        user_id = interaction.user.id
+        config = user_search_configs.get(user_id, {})
+        config["material_id"] = self.values[0]
+        user_search_configs[user_id] = config
+
+        await interaction.response.send_message(
+            f"✅ Matériau sélectionné: {self.get_option(self.values[0])}",
+            ephemeral=True
+        )
+
+    def get_option(self, value: str) -> str:
+        return next((opt.label for opt in self.options if opt.value == value), value)
+
+
+class SeasonSelectView(ui.View):
+    """Vue de sélection de saison"""
+
+    def __init__(self, user_id: int, seasons: List[Dict]):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.add_item(SeasonSelect(seasons))
+
+
+class SeasonSelect(ui.Select):
+    def __init__(self, seasons: List[Dict]):
+        options = [
+            SelectOption(
+                label=season["title"][:100],
+                value=str(season["id"]),
+                description=f"ID: {season['id']}"[:100]
+            ) for season in seasons[:25]
+        ]
+        super().__init__(
+            placeholder="Choisissez une saison...",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        user_id = interaction.user.id
+        config = user_search_configs.get(user_id, {})
+        config["season_id"] = self.values[0]
+        user_search_configs[user_id] = config
+
+        await interaction.response.send_message(
+            f"✅ Saison sélectionnée: {self.get_option(self.values[0])}",
+            ephemeral=True
+        )
+
+    def get_option(self, value: str) -> str:
+        return next((opt.label for opt in self.options if opt.value == value), value)
+
+
+class ConditionSelectView(ui.View):
+    """Vue de sélection d'état"""
+
+    def __init__(self, user_id: int, conditions: List[Dict]):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.add_item(ConditionSelect(conditions))
+
+
+class ConditionSelect(ui.Select):
+    def __init__(self, conditions: List[Dict]):
+        options = [
+            SelectOption(
+                label=condition["title"][:100],
+                value=str(condition["id"]),
+                description=f"ID: {condition['id']}"[:100]
+            ) for condition in conditions[:25]
+        ]
+        super().__init__(
+            placeholder="Choisissez un état...",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        user_id = interaction.user.id
+        config = user_search_configs.get(user_id, {})
+        config["condition_id"] = self.values[0]
+        user_search_configs[user_id] = config
+
+        await interaction.response.send_message(
+            f"✅ État sélectionné: {self.get_option(self.values[0])}",
+            ephemeral=True
+        )
+
+    def get_option(self, value: str) -> str:
+        return next((opt.label for opt in self.options if opt.value == value), value)
+
+
+# ===================== Commandes Bot =====================
+
+@bot.command()
+async def start_scraper(ctx):
+    """Démarre le scraper"""
+    channel = bot.get_channel(DISCORD_CHANNEL_SCRAPER)
+    await channel.send("✅ Scraper démarré")
+    await ctx.send(f"✅ Scraper démarré dans <#{DISCORD_CHANNEL_SCRAPER}>")
+
+
+@bot.command()
+async def stop_scraper(ctx):
+    """Arrête le scraper"""
+    channel = bot.get_channel(DISCORD_CHANNEL_SCRAPER)
+    await channel.send("🛑 Scraper arrêté")
+    await ctx.send(f"🛑 Scraper arrêté dans <#{DISCORD_CHANNEL_SCRAPER}>")
+
+
+@bot.command()
+async def search_now(ctx):
+    """Lance une recherche immédiate"""
+    channel = bot.get_channel(DISCORD_CHANNEL_SCRAPER)
+    filters = user_search_configs.get(ctx.author.id, {})
+    results = search_items(filters)
+
+    if not results:
+        await channel.send("❌ Aucun résultat trouvé")
+        return
+
+    for item in results[:5]:
+        await channel.send(embed=create_item_embed(item))
+
+    await ctx.send(f"✅ Résultats envoyés dans <#{DISCORD_CHANNEL_SCRAPER}>")
+
+
+@bot.command()
+async def scrape_items(ctx, item_url: str):
+    """Trouve des articles similaires"""
+    channel = bot.get_channel(DISCORD_CHANNEL_SCRAPER)
+    await channel.send(f"🔍 Recherche d'articles similaires...")
+    similar_items = find_similar_items(item_url)
+
+    if not similar_items:
+        await channel.send("❌ Aucun article similaire trouvé")
+        return
+
+    for item in similar_items[:5]:
+        await channel.send(embed=create_item_embed(item))
+
+    await ctx.send(f"✅ Articles similaires envoyés dans <#{DISCORD_CHANNEL_SCRAPER}>")
+
+
+@bot.command()
+async def update_catalog(ctx):
+    """Met à jour le catalogue complet (scraping + optimisation IA)"""
+    channel = bot.get_channel(DISCORD_CHANNEL_ADMIN)
+    await channel.send("⏳ Mise à jour du catalogue en cours...")
+
+    # Étape 1 : Scraping du catalogue brut
+    success_scraping = await asyncio.to_thread(update_vinted_catalog)
+
+    if not success_scraping:
+        await channel.send("❌ Échec du scraping brut")
+        await ctx.send(f"⚠️ Statut envoyé dans <#{DISCORD_CHANNEL_ADMIN}>")
+        return
+
+    # Étape 2 : Optimisation IA via DeepSeek
+    from platov_deepseek import optimize_catalog
+    success_optimization = await asyncio.to_thread(optimize_catalog)
+
+    if success_optimization:
+        await channel.send("✅ Catalogue optimisé avec succès par DeepSeek")
+    else:
+        await channel.send("⚠️ Catalogue brut mis à jour, mais échec de l’optimisation IA")
+
+    await ctx.send(f"✅ Statut complet envoyé dans <#{DISCORD_CHANNEL_ADMIN}>")
+
+
+@bot.command()
+async def catalog_status(ctx):
+    """Affiche l'état du catalogue"""
+    channel = bot.get_channel(DISCORD_CHANNEL_ADMIN)
+    age_seconds = get_catalog_age()
+
+    if age_seconds == 9999999:
+        await channel.send("❌ Catalogue non chargé ou corrompu")
+    else:
+        hours = age_seconds // 3600
+        minutes = (age_seconds % 3600) // 60
+        await channel.send(f"🔄 Catalogue mis à jour il y a {hours} heures et {minutes} minutes")
+
+    await ctx.send(f"✅ Statut catalogue dans <#{DISCORD_CHANNEL_ADMIN}>")
+
+
+@bot.command()
+async def start_deepseek(ctx):
+    """Active le mode DeepSeek pour générer des descriptions"""
+    global deepseek_active
+    deepseek_active = True
+    await ctx.send("🧠 DeepSeek est prêt à générer vos descriptions.")
+
+
+@bot.command()
+async def stop_deepseek(ctx):
+    """Désactive le mode DeepSeek"""
+    global deepseek_active
+    deepseek_active = False
+    await ctx.send("🛑 DeepSeek est désactivé.")
+
+
+@bot.command(name="search")
+async def search_cmd(ctx):
+    """Menu interactif de recherche"""
+    if not await ensure_fresh_catalog(ctx):
+        return
+
+    view = SearchMenuView(ctx.author.id)
+    await ctx.send(
+        "🔍 **Menu de Recherche Vinted**\nConfigurez votre recherche:",
+        view=view
+    )
+
+
+# ===================== Tâches & Événements =====================
+
+@bot.event
+async def on_message(message):
+    """Intercepte les messages pour le mode DeepSeek"""
+    await bot.process_commands(message)
+
+    if deepseek_active and not message.author.bot and not message.content.startswith("!"):
+        # Si le message contient une image
+        if message.attachments:
+            file = message.attachments[0]
+            import os
+            temp_dir = os.path.join(os.getcwd(), "temp")
+            os.makedirs(temp_dir, exist_ok=True)  # Crée le dossier s'il n'existe pas
+            image_path = os.path.join(temp_dir, file.filename)
+            await file.save(image_path)
+
+            # ✅ Utilisation de la vision
+            from platov_deepseek import generer_description_depuis_image
+            description = generer_description_depuis_image(image_path)
+
+        else:
+            # ✅ Sinon, texte classique DeepSeek
+            description = generer_description_depuis_texte(message.content)
+
+        # Envoi dans le salon descriptions
+        channel = bot.get_channel(DISCORD_CHANNEL_DESCRIPTIONS)
+        await channel.send(description)
+
+
+
+@tasks.loop(hours=12)
+async def auto_update_catalog():
+    """Mise à jour automatique du catalogue (version asynchrone)"""
+    if not is_catalog_fresh():
+        logger.info("Mise à jour automatique du catalogue...")
+        # Appel asynchrone pour éviter le freeze
+        if await asyncio.to_thread(update_vinted_catalog):
+            logger.info("Catalogue mis à jour avec succès")
+        else:
+            logger.error("Échec de la mise à jour automatique du catalogue")
+
+
+@auto_update_catalog.before_loop
+async def before_auto_update():
+    await bot.wait_until_ready()
+
+
+@bot.event
+async def on_ready():
+    logger.info(f"✅ Bot connecté: {bot.user.name}")
+    if not auto_update_catalog.is_running():
+        auto_update_catalog.start()
+
+
+# ===================== Lancement =====================
+
+if __name__ == "__main__":
+    logger.info("Démarrage du Vinted Bot Pro...")
+    bot.run(DISCORD_TOKEN)
